@@ -3,4 +3,4 @@
 pub use alloy_json_rpc::Id;
 
 mod request;
-pub use request::InboundRequest;
+pub use request::Request;

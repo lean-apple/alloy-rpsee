@@ -1,10 +1,4 @@
 //! Inbound request parsing.
-//!
-//! [`alloy_json_rpc::Request`] is a client type. It requires `params`, rejects unknown members,
-//! and decodes a missing `id` and `"id": null` to the same [`Id::None`]. A server must accept the
-//! first two and tell the last two apart: a missing id is a notification, while a `null` id is a
-//! call that gets an answer. [`InboundRequest`] does all three in one borrowed serde pass and
-//! reuses Alloy's [`Id`].
 
 use alloy_json_rpc::Id;
 use serde::{Deserialize, Deserializer};
@@ -12,13 +6,29 @@ use serde_json::value::RawValue;
 use std::borrow::Cow;
 
 /// A JSON-RPC 2.0 request object borrowed from the request body.
+///
+/// A missing `id` is a notification, which gets no answer. `"id": null` is a call, which does:
+///
+/// ```
+/// use alloy_rpc_server::{Id, Request};
+///
+/// let notification = serde_json::from_str::<Request<'_>>(r#"{"jsonrpc":"2.0","method":"m"}"#)?;
+/// assert_eq!(notification.id, None);
+///
+/// let call = serde_json::from_str::<Request<'_>>(r#"{"jsonrpc":"2.0","method":"m","id":null}"#)?;
+/// assert_eq!(call.id, Some(Id::None));
+/// # Ok::<_, serde_json::Error>(())
+/// ```
+///
+/// [`alloy_json_rpc::Request`] can't be reused: it is a client type that reads both cases as
+/// [`Id::None`], requires `params`, and rejects unknown members.
 #[derive(Debug, Deserialize)]
-pub struct InboundRequest<'a> {
+pub struct Request<'a> {
     /// Must be `"2.0"`.
     #[serde(rename = "jsonrpc")]
     _version: Version,
-    /// `None` when the `id` member is absent (a notification), `Some(Id::None)` for `null`.
-    #[serde(default, deserialize_with = "present")]
+    /// `None` when the `id` member is absent, `Some(Id::None)` when it is `null`.
+    #[serde(default, deserialize_with = "deserialize_present_id")]
     pub id: Option<Id>,
     /// Borrowed from the body unless the JSON string contains escapes.
     #[serde(borrow)]
@@ -34,8 +44,11 @@ enum Version {
     V2,
 }
 
-/// Deserializes a present `id` member, including `null`, as `Some`.
-fn present<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Id>, D::Error> {
+/// Called only when `id` is present, so `null` becomes `Some(Id::None)`. A missing `id` takes
+/// `#[serde(default)]` instead.
+fn deserialize_present_id<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Id>, D::Error> {
     Id::deserialize(deserializer).map(Some)
 }
 
@@ -46,7 +59,7 @@ mod tests {
 
     type ClientRequest = alloy_json_rpc::Request<Box<RawValue>>;
 
-    fn parse(body: &[u8]) -> serde_json::Result<InboundRequest<'_>> {
+    fn parse(body: &[u8]) -> serde_json::Result<Request<'_>> {
         serde_json::from_slice(body)
     }
 
