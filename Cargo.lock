@@ -65,6 +65,7 @@ dependencies = [
  "serde_json",
  "test-case",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]
