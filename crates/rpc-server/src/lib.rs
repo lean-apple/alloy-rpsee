@@ -2,5 +2,8 @@
 
 pub use alloy_json_rpc::Id;
 
+mod params;
+pub use params::FromParams;
+
 mod request;
 pub use request::Request;
