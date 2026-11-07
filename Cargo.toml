@@ -24,3 +24,10 @@ all = "warn"
 all = { level = "warn", priority = -1 }
 use_self = "warn"
 redundant_clone = "warn"
+
+[workspace.dependencies]
+alloy-json-rpc = { version = "2.5.0", default-features = false }
+serde = { version = "1.0", default-features = false, features = ["derive", "std"] }
+serde_json = { version = "1.0", default-features = false, features = ["raw_value", "std"] }
+
+test-case = { version = "3", default-features = false }
