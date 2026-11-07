@@ -11,8 +11,7 @@
 //! {"block": "0xab"} -> -32602 Invalid params
 //! ```
 
-use crate::error;
-use alloy_json_rpc::ErrorPayload;
+use crate::InvalidParams;
 use serde::{
     Deserializer,
     de::{DeserializeOwned, IgnoredAny, SeqAccess, Visitor},
@@ -25,12 +24,12 @@ use std::fmt;
 ///
 /// # Errors
 ///
-/// Returns `-32602 Invalid params` when the params don't match `T`.
+/// Returns [`InvalidParams`] when the params don't match `T`.
 ///
 /// # Examples
 ///
 /// ```
-/// use alloy_rpc_server::parse_params;
+/// use alloy_rpc_server::{ErrorPayload, parse_params};
 /// use serde::Deserialize;
 /// use serde_json::value::RawValue;
 ///
@@ -39,15 +38,16 @@ use std::fmt;
 ///
 /// let raw = RawValue::from_string(r#"["0xab"]"#.to_owned())?;
 /// assert_eq!(parse_params::<Params>(Some(&raw)).unwrap(), Params("0xab".to_owned(), None));
-/// assert_eq!(parse_params::<Params>(None).unwrap_err().code, -32602);
+/// let err = parse_params::<Params>(None).unwrap_err();
+/// assert_eq!(ErrorPayload::from(err).code, -32602);
 /// # Ok::<_, serde_json::Error>(())
 /// ```
-pub fn parse_params<T: DeserializeOwned>(params: Option<&RawValue>) -> Result<T, ErrorPayload> {
+pub fn parse_params<T: DeserializeOwned>(params: Option<&RawValue>) -> Result<T, InvalidParams> {
     // A `RawValue` holds exactly one JSON value, so nothing can trail it.
     T::deserialize(IgnoreExtraParams(&mut serde_json::Deserializer::from_str(
         params.map_or("[]", RawValue::get),
     )))
-    .map_err(error::invalid_params)
+    .map_err(InvalidParams::from)
 }
 
 /// Lets a tuple or tuple struct decode an array longer than its fields, which serde rejects.
@@ -100,6 +100,7 @@ impl<'de, V: Visitor<'de>> Visitor<'de> for IgnoreExtraParams<V> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_json_rpc::ErrorPayload;
     use serde::Deserialize;
     use test_case::test_case;
 
@@ -109,7 +110,7 @@ mod tests {
     #[derive(Debug, PartialEq, Deserialize)]
     struct OptionalOnly(#[serde(default)] Option<u64>);
 
-    fn parse<T: DeserializeOwned>(raw: Option<&str>) -> Result<T, ErrorPayload> {
+    fn parse<T: DeserializeOwned>(raw: Option<&str>) -> Result<T, InvalidParams> {
         let raw = raw.map(|raw| RawValue::from_string(raw.to_owned()).unwrap());
         parse_params(raw.as_deref())
     }
@@ -137,7 +138,7 @@ mod tests {
     #[test_case(Some(r#"[5]"#), "invalid type: integer `5`, expected a string at line 1 column 2" ; "wrong type")]
     #[test_case(Some(r#"{"a":1}"#), "invalid type: map, expected tuple struct Params at line 1 column 0" ; "object")]
     fn rejects(raw: Option<&str>, data: &str) {
-        let err = parse::<Params>(raw).unwrap_err();
+        let err = ErrorPayload::from(parse::<Params>(raw).unwrap_err());
         assert_eq!((err.code, err.message.as_ref()), (-32602, "Invalid params"));
         assert_eq!(err.data.unwrap().get(), serde_json::to_string(data).unwrap());
     }
