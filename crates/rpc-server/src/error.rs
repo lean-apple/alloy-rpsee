@@ -32,6 +32,7 @@ impl From<InvalidParams> for ErrorPayload {
 #[derive(Debug, thiserror::Error)]
 #[error("Exceeded max limit of {limit}")]
 pub(crate) struct OversizedResponse {
+    // The size limit in bytes.
     pub(crate) limit: usize,
 }
 

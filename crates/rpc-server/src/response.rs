@@ -39,7 +39,9 @@ const INTERNAL_ERROR_JSON: &str =
 /// ```
 #[derive(Debug)]
 pub struct MethodResponse {
+    // The response as sent on the wire.
     json: String,
+    // Whether `json` holds a result or an error.
     kind: Kind,
 }
 
@@ -102,30 +104,40 @@ impl MethodResponse {
 // Whether a response carries a result or an error.
 #[derive(Debug)]
 enum Kind {
+    // Carries a `result`.
     Success,
+    // Carries an `error`.
     Error,
 }
 
 // An error response that omits an empty `data`, unlike Alloy's.
 #[derive(Serialize)]
 struct ErrorResponse<'a> {
+    // Always `"2.0"`.
     jsonrpc: &'static str,
+    // The id of the call being answered.
     id: &'a Id,
+    // The error itself.
     error: ErrorBody<'a>,
 }
 
 // The `error` member of an `ErrorResponse`.
 #[derive(Serialize)]
 struct ErrorBody<'a> {
+    // The JSON-RPC error code.
     code: i64,
+    // A short description of the error.
     message: &'a str,
+    // Extra detail, left out when empty.
     #[serde(skip_serializing_if = "Option::is_none")]
     data: Option<&'a RawValue>,
 }
 
 // A buffer that fails writes past `max_len`, so an oversized response stops serializing.
 struct BoundedWriter {
+    // The serialized response so far.
     buf: Vec<u8>,
+    // The most bytes `buf` may hold.
     max_len: usize,
 }
 
