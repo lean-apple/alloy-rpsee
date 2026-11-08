@@ -4,7 +4,7 @@
 //! soon as the response passes its size limit, so an oversized result never takes more memory than
 //! the limit.
 
-use crate::error::OversizedResponse;
+use crate::{error::OversizedResponse, request::Version};
 use alloy_json_rpc::{ErrorPayload, Id, Response, ResponsePayload};
 use serde::Serialize;
 use serde_json::value::RawValue;
@@ -76,7 +76,7 @@ impl MethodResponse {
         let err = err.into();
         // Alloy's `ErrorPayload` writes `"data": null`, which Reth's clients don't receive today.
         let response = ErrorResponse {
-            jsonrpc: "2.0",
+            jsonrpc: Version::V2,
             id: &id,
             error: ErrorBody { code: err.code, message: &err.message, data: err.data.as_deref() },
         };
@@ -113,8 +113,8 @@ enum Kind {
 // An error response that omits an empty `data`, unlike Alloy's.
 #[derive(Serialize)]
 struct ErrorResponse<'a> {
-    // Always `"2.0"`.
-    jsonrpc: &'static str,
+    // The protocol version.
+    jsonrpc: Version,
     // The id of the call being answered.
     id: &'a Id,
     // The error itself.
