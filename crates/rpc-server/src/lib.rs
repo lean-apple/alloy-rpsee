@@ -3,7 +3,10 @@
 pub use alloy_json_rpc::{ErrorPayload, Id};
 
 mod error;
-pub use error::InvalidParams;
+pub use error::{InvalidParams, RegisterMethodError};
+
+mod methods;
+pub use methods::{MethodCallback, Methods, ResponseFuture};
 
 mod params;
 pub use params::parse_params;
@@ -13,5 +16,8 @@ pub use request::Request;
 
 mod response;
 pub use response::MethodResponse;
+
+mod rpc_module;
+pub use rpc_module::RpcModule;
 
 mod writer;

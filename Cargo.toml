@@ -27,9 +27,12 @@ redundant_clone = "warn"
 
 [workspace.dependencies]
 alloy-json-rpc = { version = "2.5.0", default-features = false }
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+rustc-hash = { version = "2", default-features = false, features = ["std"] }
 serde = { version = "1.0", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1.0", default-features = false, features = ["raw_value", "std"] }
 thiserror = { version = "2", default-features = false }
 tracing = { version = "0.1", default-features = false }
 
 test-case = { version = "3", default-features = false }
+tokio = { version = "1", default-features = false }
