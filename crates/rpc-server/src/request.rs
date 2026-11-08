@@ -1,7 +1,7 @@
 //! Inbound request parsing.
 
 use alloy_json_rpc::Id;
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::value::RawValue;
 use std::borrow::Cow;
 
@@ -38,8 +38,10 @@ pub struct Request<'a> {
     pub params: Option<&'a RawValue>,
 }
 
-#[derive(Debug, Deserialize)]
-enum Version {
+// The only JSON-RPC version, `"2.0"`.
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) enum Version {
+    // JSON-RPC 2.0.
     #[serde(rename = "2.0")]
     V2,
 }

@@ -1,10 +1,14 @@
 //! Server errors.
 
 use alloy_json_rpc::ErrorPayload;
-use serde_json::value::to_raw_value;
+use serde_json::value::{RawValue, to_raw_value};
+use std::borrow::Cow;
 
-/// Caps the error `data` echoed back to the caller.
+// Caps the error `data` echoed back to the caller.
 const MAX_ERROR_DATA_LEN: usize = 1024;
+
+// A response exceeded the size limit.
+const OVERSIZED_RESPONSE_CODE: i64 = -32008;
 
 /// The params of a call don't match the method's arguments.
 ///
@@ -20,13 +24,32 @@ impl From<InvalidParams> for ErrorPayload {
             message.truncate(message.floor_char_boundary(MAX_ERROR_DATA_LEN));
             message.push('…');
         }
-        let payload = Self::invalid_params();
-        // Never panic while answering a bad request.
-        match to_raw_value(&message) {
-            Ok(data) => Self { data: Some(data), ..payload },
-            Err(_) => payload,
+        Self { data: error_data(&message), ..Self::invalid_params() }
+    }
+}
+
+// A response exceeded its size limit. Converts into `-32008 Response is too big` naming the limit.
+#[derive(Debug, thiserror::Error)]
+#[error("Exceeded max limit of {limit}")]
+pub(crate) struct OversizedResponse {
+    // The size limit in bytes.
+    pub(crate) limit: usize,
+}
+
+impl From<OversizedResponse> for ErrorPayload {
+    fn from(err: OversizedResponse) -> Self {
+        Self {
+            code: OVERSIZED_RESPONSE_CODE,
+            message: Cow::Borrowed("Response is too big"),
+            data: error_data(&err.to_string()),
         }
     }
+}
+
+// A message as the JSON string in an error's `data`.
+fn error_data(message: &str) -> Option<Box<RawValue>> {
+    // Never panic while answering a bad request, even though a string always serializes.
+    to_raw_value(message).ok()
 }
 
 #[cfg(test)]
@@ -54,5 +77,12 @@ mod tests {
         let message = format!("invalid type: string \"{value}");
         let cut = &message[..message.floor_char_boundary(MAX_ERROR_DATA_LEN)];
         assert_eq!(data(payload(&format!(r#""{value}""#))), format!("{cut}…"));
+    }
+
+    #[test]
+    fn oversized_response_names_the_limit() {
+        let payload = ErrorPayload::from(OversizedResponse { limit: 64 });
+        assert_eq!((payload.code, payload.message.as_ref()), (-32008, "Response is too big"));
+        assert_eq!(data(payload), "Exceeded max limit of 64");
     }
 }
