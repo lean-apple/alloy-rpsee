@@ -4,15 +4,10 @@
 //! soon as the response passes its size limit, so an oversized result never takes more memory than
 //! the limit.
 
-use crate::{error::OversizedResponse, request::Version};
+use crate::{error::OversizedResponse, request::Version, writer::BoundedWriter};
 use alloy_json_rpc::{ErrorPayload, Id, Response, ResponsePayload};
 use serde::Serialize;
 use serde_json::value::RawValue;
-use std::io;
-
-// Initial buffer capacity. Growing from it costs nothing measurable next to serializing a large
-// result.
-const INITIAL_CAPACITY: usize = 128;
 
 // Sent if an error response can't be serialized, which a well-formed `ErrorPayload` never hits.
 const INTERNAL_ERROR_JSON: &str =
@@ -51,11 +46,10 @@ impl MethodResponse {
     /// A larger response becomes `-32008 Response is too big`, and a result that fails to serialize
     /// becomes `-32603 Internal error`.
     pub fn success<T: Serialize + ?Sized>(id: Id, result: &T, max_len: usize) -> Self {
-        let mut writer =
-            BoundedWriter { buf: Vec::with_capacity(INITIAL_CAPACITY.min(max_len)), max_len };
+        let mut writer = BoundedWriter::new(max_len);
         let response = Response { id, payload: ResponsePayload::<&T, ()>::Success(result) };
         match serde_json::to_writer(&mut writer, &response) {
-            Ok(()) => match String::from_utf8(writer.buf) {
+            Ok(()) => match String::from_utf8(writer.into_bytes()) {
                 Ok(json) => Self { json, kind: Kind::Success },
                 // serde_json only writes UTF-8.
                 Err(_) => Self::error(response.id, ErrorPayload::internal_error()),
@@ -131,39 +125,6 @@ struct ErrorBody<'a> {
     // Extra detail, left out when empty.
     #[serde(skip_serializing_if = "Option::is_none")]
     data: Option<&'a RawValue>,
-}
-
-// A buffer that fails writes past `max_len`, so an oversized response stops serializing.
-struct BoundedWriter {
-    // The serialized response so far.
-    buf: Vec<u8>,
-    // The most bytes `buf` may hold.
-    max_len: usize,
-}
-
-impl io::Write for &mut BoundedWriter {
-    // serde_json writes a response in many small pieces, so each write must stay a check and a
-    // copy.
-    #[inline]
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.write_all(buf)?;
-        Ok(buf.len())
-    }
-
-    #[inline]
-    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
-        // `self.buf` never grows past `max_len`, so this can't underflow.
-        if buf.len() > self.max_len - self.buf.len() {
-            return Err(io::Error::from(io::ErrorKind::OutOfMemory));
-        }
-        self.buf.extend_from_slice(buf);
-        Ok(())
-    }
-
-    #[inline]
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
 }
 
 #[cfg(test)]
