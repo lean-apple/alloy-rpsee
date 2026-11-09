@@ -5,9 +5,9 @@ pub use alloy_json_rpc::{ErrorPayload, Id};
 mod batch;
 pub use batch::{Batch, BatchEntry, BatchEntryErr};
 
-mod error;
+pub mod error;
 pub use error::{
-    DisconnectError, InvalidParams, PendingSubscriptionAcceptError, RegisterMethodError,
+    DisconnectError, ErrorCode, InvalidParams, PendingSubscriptionAcceptError, RegisterMethodError,
     SendTimeoutError, TrySendError,
 };
 

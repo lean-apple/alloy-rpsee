@@ -2,7 +2,7 @@
 
 use crate::{
     MethodResponse, Methods, PendingSubscriptionSink, SubscriptionId, SubscriptionResult,
-    error::{RegisterMethodError, TooManySubscriptions},
+    error::{ErrorCode, RegisterMethodError},
     methods::MethodCallback,
     parse_params,
     subscription::SinkInner,
@@ -173,7 +173,7 @@ impl<Context: Send + Sync + 'static> RpcModule<Context> {
                     } else {
                         tracing::debug!(%err, method = method_name, "blocking RPC method cancelled");
                     }
-                    MethodResponse::error(error_id, ErrorPayload::internal_error())
+                    MethodResponse::error(error_id, ErrorCode::InternalError)
                 })
             }))
         });
@@ -229,7 +229,7 @@ impl<Context: Send + Sync + 'static> RpcModule<Context> {
                 Err(err) => return Either::Left(ready(MethodResponse::error(id, err))),
             };
             let Some(permit) = connection.try_acquire() else {
-                let err = TooManySubscriptions { limit: connection.max_subscriptions() };
+                let err = ErrorCode::TooManySubscriptions.exceeded(connection.max_subscriptions());
                 return Either::Left(ready(MethodResponse::error(id, err)));
             };
             let subscription_id = connection.next_id();
@@ -262,7 +262,7 @@ impl<Context: Send + Sync + 'static> RpcModule<Context> {
             Either::Right(Box::pin(async move {
                 answered
                     .await
-                    .unwrap_or_else(|_| MethodResponse::error(id, ErrorPayload::internal_error()))
+                    .unwrap_or_else(|_| MethodResponse::error(id, ErrorCode::InternalError))
             }))
         });
         self.methods.verify_and_insert(subscribe, subscribe_method)
@@ -310,7 +310,7 @@ impl<Context> From<RpcModule<Context>> for Methods {
 fn no_connection(id: Id, method: &str) -> MethodResponse {
     // Clients choose the transport, so this is theirs to fix.
     tracing::debug!(method, "subscriptions need a connection, such as a WebSocket");
-    MethodResponse::error(id, ErrorPayload::internal_error())
+    MethodResponse::error(id, ErrorCode::InternalError)
 }
 
 // The response to a method's result.

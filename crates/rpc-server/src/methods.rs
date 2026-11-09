@@ -230,7 +230,7 @@ mod tests {
     #[test_case(r#"{"jsonrpc":"2.0","method":"a"}"#, "" ; "notification")]
     #[test_case(r#"{"jsonrpc":"2.0","id":1,"method":"b"}"#, r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}"# ; "unknown method")]
     #[test_case(r#"{"jsonrpc":"2.0","id":1"#, r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}"# ; "not json")]
-    #[test_case(r#"{"id":1,"method":"a"}"#, r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"Invalid Request"}}"# ; "not a request")]
+    #[test_case(r#"{"id":1,"method":"a"}"#, r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"Invalid request"}}"# ; "not a request")]
     #[test_case(r#"[{"jsonrpc":"2.0","id":1,"method":"a"}]"#, r#"[{"jsonrpc":"2.0","id":1,"result":"ok"}]"# ; "batch")]
     #[tokio::test]
     async fn raw_json_request(request: &str, response: &str) {
