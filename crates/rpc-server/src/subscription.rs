@@ -25,6 +25,12 @@
 // DEALINGS IN THE SOFTWARE.
 
 //! Subscriptions: the connection they run on, their ids, and the sinks that send notifications.
+//!
+//! A subscribe call is answered with the subscription id before any notification, all through
+//! the connection's bounded queue, so a slow client holds back its own subscriptions, which can
+//! wait, time out, or check the queue's room. A subscription ends when the client unsubscribes,
+//! the connection closes, or its last sink is dropped. An error it returns is sent as a last
+//! notification.
 
 use crate::{
     MethodResponse,
