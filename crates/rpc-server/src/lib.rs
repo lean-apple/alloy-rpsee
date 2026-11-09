@@ -6,10 +6,13 @@ mod batch;
 pub use batch::{Batch, BatchEntry, BatchEntryErr};
 
 mod error;
-pub use error::{InvalidParams, RegisterMethodError};
+pub use error::{
+    DisconnectError, InvalidParams, PendingSubscriptionAcceptError, RegisterMethodError,
+    SendTimeoutError, TrySendError,
+};
 
 mod methods;
-pub use methods::{MethodCallback, Methods, ResponseFuture};
+pub use methods::{CallContext, MethodCallback, Methods, ResponseFuture};
 
 mod params;
 pub use params::parse_params;
@@ -25,6 +28,13 @@ pub use rpc_module::RpcModule;
 
 mod service;
 pub use service::{BatchRequestConfig, RpcService, RpcServiceT, handle_rpc_call};
+
+mod subscription;
+pub use subscription::{
+    Connection, ConnectionId, IdProvider, PendingSubscriptionSink, RandomIntegerIdProvider,
+    RandomStringIdProvider, SubscriptionError, SubscriptionId, SubscriptionMessage,
+    SubscriptionResult, SubscriptionSink,
+};
 
 mod writer;
 

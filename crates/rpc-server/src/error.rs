@@ -1,5 +1,6 @@
 //! Server errors.
 
+use crate::SubscriptionMessage;
 use alloy_json_rpc::ErrorPayload;
 use serde_json::value::{RawValue, to_raw_value};
 use std::borrow::Cow;
@@ -117,6 +118,59 @@ impl From<OversizedBatchResponse> for ErrorPayload {
             data: error_data(&err.to_string()),
         }
     }
+}
+
+// Too many subscriptions on one connection.
+const TOO_MANY_SUBSCRIPTIONS_CODE: i64 = -32006;
+
+// A connection reached its subscription limit. Converts into `-32006` naming the limit.
+#[derive(Debug, thiserror::Error)]
+#[error("Exceeded max limit of {limit}")]
+pub(crate) struct TooManySubscriptions {
+    // The most subscriptions active at once.
+    pub(crate) limit: u32,
+}
+
+impl From<TooManySubscriptions> for ErrorPayload {
+    fn from(err: TooManySubscriptions) -> Self {
+        Self {
+            code: TOO_MANY_SUBSCRIPTIONS_CODE,
+            message: Cow::Borrowed("Too many subscriptions on the connection"),
+            data: error_data(&err.to_string()),
+        }
+    }
+}
+
+/// A subscription couldn't be accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("the subscription couldn't be accepted")]
+pub struct PendingSubscriptionAcceptError;
+
+/// A notification wasn't sent because the subscription ended. Holds the notification.
+#[derive(Debug, thiserror::Error)]
+#[error("the subscription ended")]
+pub struct DisconnectError(pub SubscriptionMessage);
+
+/// A notification wasn't sent within the timeout. Holds the notification.
+#[derive(Debug, thiserror::Error)]
+pub enum SendTimeoutError {
+    /// The queue stayed full until the timeout.
+    #[error("the subscription queue stayed full")]
+    Timeout(SubscriptionMessage),
+    /// The subscription ended.
+    #[error("the subscription ended")]
+    Closed(SubscriptionMessage),
+}
+
+/// A notification wasn't sent right away. Holds the notification.
+#[derive(Debug, thiserror::Error)]
+pub enum TrySendError {
+    /// The queue is full.
+    #[error("the subscription queue is full")]
+    Full(SubscriptionMessage),
+    /// The subscription ended.
+    #[error("the subscription ended")]
+    Closed(SubscriptionMessage),
 }
 
 // A message as the JSON string in an error's `data`.

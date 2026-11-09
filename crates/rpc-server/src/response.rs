@@ -85,6 +85,11 @@ impl MethodResponse {
         Self { json: String::new(), kind: Kind::Notification }
     }
 
+    // The answer to a subscribe call that its subscription already sent.
+    pub(crate) const fn subscription() -> Self {
+        Self { json: String::new(), kind: Kind::Subscription }
+    }
+
     // A batch's joined responses.
     pub(crate) const fn from_batch(json: String) -> Self {
         Self { json, kind: Kind::Batch }
@@ -105,6 +110,12 @@ impl MethodResponse {
         matches!(self.kind, Kind::Notification)
     }
 
+    /// Returns `true` for an accepted subscribe call, whose answer the subscription already sent
+    /// on its connection, so the transport doesn't send it.
+    pub const fn is_subscription(&self) -> bool {
+        matches!(self.kind, Kind::Subscription)
+    }
+
     /// Takes the serialized JSON.
     pub fn into_json(self) -> String {
         self.json
@@ -122,6 +133,8 @@ enum Kind {
     Notification,
     // A batch, with an array of responses.
     Batch,
+    // An accepted subscribe call, already answered on its connection.
+    Subscription,
 }
 
 // An error response that omits an empty `data`, unlike Alloy's.
