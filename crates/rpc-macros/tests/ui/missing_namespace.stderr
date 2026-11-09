@@ -1,0 +1,7 @@
+error: missing `namespace = ".."`
+ --> tests/ui/missing_namespace.rs:1:1
+  |
+1 | #[alloy_rpc_macros::rpc(server)]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `alloy_rpc_macros::rpc` (in Nightly builds, run with -Z macro-backtrace for more info)

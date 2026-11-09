@@ -28,11 +28,16 @@ redundant_clone = "warn"
 [workspace.dependencies]
 alloy-json-rpc = { version = "2.5.0", default-features = false }
 alloy-primitives = { version = "1.7", default-features = false, features = ["map"] }
+alloy-rpc-server = { version = "0.1.0", path = "crates/rpc-server" }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+proc-macro2 = { version = "1", default-features = false, features = ["proc-macro"] }
+quote = { version = "1", default-features = false, features = ["proc-macro"] }
 serde = { version = "1.0", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1.0", default-features = false, features = ["raw_value", "std"] }
+syn = { version = "2", default-features = false, features = ["clone-impls", "full", "parsing", "printing", "proc-macro", "visit"] }
 thiserror = { version = "2", default-features = false }
+tokio = { version = "1", default-features = false }
 tracing = { version = "0.1", default-features = false }
 
 test-case = { version = "3", default-features = false }
-tokio = { version = "1", default-features = false }
+trybuild = { version = "1", default-features = false }

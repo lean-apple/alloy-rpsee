@@ -1,0 +1,5 @@
+error: `a_m` is registered twice
+ --> tests/ui/duplicate_name.rs:7:8
+  |
+7 |     fn n(&self) -> alloy_rpc_server::RpcResult<()>;
+  |        ^

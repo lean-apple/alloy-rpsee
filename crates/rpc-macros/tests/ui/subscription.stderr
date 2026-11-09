@@ -1,0 +1,5 @@
+error: `#[subscription]` isn't supported yet
+ --> tests/ui/subscription.rs:3:7
+  |
+3 |     #[subscription(name = "subscribe", item = u64)]
+  |       ^^^^^^^^^^^^

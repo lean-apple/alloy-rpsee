@@ -1,0 +1,5 @@
+error: missing `name = ".."`
+ --> tests/ui/missing_name.rs:3:7
+  |
+3 |     #[method(aliases = ["b"])]
+  |       ^^^^^^

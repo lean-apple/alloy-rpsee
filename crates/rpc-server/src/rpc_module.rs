@@ -124,6 +124,52 @@ impl<Context: Send + Sync + 'static> RpcModule<Context> {
         self.methods.verify_and_insert(method_name, method)
     }
 
+    /// Registers a method that may block, run on tokio's blocking thread pool along with the
+    /// serialization of its result.
+    ///
+    /// A method that panics is answered with `-32603 Internal error`. Its calls must run within a
+    /// tokio runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegisterMethodError::AlreadyRegistered`] if `method_name` is taken.
+    pub fn register_blocking_method<P, R, E, F>(
+        &mut self,
+        method_name: &'static str,
+        callback: F,
+    ) -> Result<&mut MethodCallback, RegisterMethodError>
+    where
+        P: DeserializeOwned + Send + 'static,
+        R: Serialize,
+        E: Into<ErrorPayload>,
+        F: Fn(P, Arc<Context>) -> Result<R, E> + Send + Sync + 'static,
+    {
+        let ctx = self.ctx.clone();
+        let callback = Arc::new(callback);
+        let method = MethodCallback::new(move |id, params, max_response_size| {
+            let params = match parse_params::<P>(params) {
+                Ok(params) => params,
+                Err(err) => return Either::Left(ready(MethodResponse::error(id, err))),
+            };
+            let (ctx, callback, error_id) = (ctx.clone(), callback.clone(), id.clone());
+            let call = tokio::task::spawn_blocking(move || {
+                respond(id, callback(params, ctx), max_response_size)
+            });
+            Either::Right(Box::pin(async move {
+                call.await.unwrap_or_else(|err| {
+                    // The task also fails when the runtime shuts down, which isn't a fault.
+                    if err.is_panic() {
+                        tracing::error!(%err, method = method_name, "blocking RPC method panicked");
+                    } else {
+                        tracing::debug!(%err, method = method_name, "blocking RPC method cancelled");
+                    }
+                    MethodResponse::error(error_id, ErrorPayload::internal_error())
+                })
+            }))
+        });
+        self.methods.verify_and_insert(method_name, method)
+    }
+
     /// Registers `alias` as another name for the method `existing`.
     ///
     /// # Errors
@@ -242,6 +288,29 @@ mod tests {
         assert_eq!(
             response.await.into_json(),
             r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32008,"message":"Response is too big","data":"Exceeded max limit of 16"}}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn blocking_method_runs_off_the_runtime() {
+        let mut module = RpcModule::new(AtomicUsize::new(7));
+        module
+            .register_blocking_method("load", |(): (), value: Arc<AtomicUsize>| {
+                Ok::<_, ErrorPayload>(value.load(Ordering::Relaxed))
+            })
+            .unwrap();
+        module
+            .register_blocking_method("boom", |(): (), _| -> Result<(), ErrorPayload> {
+                panic!("boom")
+            })
+            .unwrap();
+        assert_eq!(
+            module.raw_json_request(&call("load", "[]")).await,
+            r#"{"jsonrpc":"2.0","id":1,"result":7}"#
+        );
+        assert_eq!(
+            module.raw_json_request(&call("boom", "[]")).await,
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"Internal error"}}"#
         );
     }
 

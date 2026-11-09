@@ -1,0 +1,5 @@
+error: `blocking` methods can't be `async`
+ --> tests/ui/blocking_async.rs:4:5
+  |
+4 |     async fn m(&self) -> alloy_rpc_server::RpcResult<()>;
+  |     ^^^^^
