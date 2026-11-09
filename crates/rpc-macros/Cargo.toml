@@ -22,5 +22,5 @@ syn.workspace = true
 [dev-dependencies]
 alloy-rpc-server.workspace = true
 serde.workspace = true
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 trybuild.workspace = true

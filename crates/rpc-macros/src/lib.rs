@@ -72,7 +72,13 @@ impl RpcTrait {
         let methods = self.methods.iter().map(RpcMethod::render_signature);
         let into_rpc = self.render_into_rpc()?;
         let params = self.methods.iter().filter_map(|method| method.render_params(&self.item));
+        // A trait without docs still gets one, so the generated trait passes `missing_docs`.
+        let doc = (!attrs.iter().any(|attr| attr.path().is_ident("doc"))).then(|| {
+            let doc = format!("Server trait implementation for the `{ident}` RPC API.");
+            quote!(#[doc = #doc])
+        });
         Ok(quote! {
+            #doc
             #(#attrs)*
             #vis trait #server #impl_generics: #(#supertraits +)* Sized + Send + Sync + 'static
             #where_clause
