@@ -1,0 +1,5 @@
+error: RPC methods take `&self`
+ --> tests/ui/mut_self.rs:4:5
+  |
+4 |     fn m(&mut self) -> alloy_rpc_server::RpcResult<()>;
+  |     ^^
