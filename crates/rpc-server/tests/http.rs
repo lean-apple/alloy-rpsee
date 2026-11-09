@@ -278,3 +278,19 @@ async fn fallible_http_middleware_wraps_the_server() {
     let body = response.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(body, r#"{"jsonrpc":"2.0","id":1,"result":"0x1"}"#);
 }
+
+#[tokio::test(start_paused = true)]
+async fn silent_connection_is_closed() {
+    let (addr, _handle) = start(ServerConfig::default()).await;
+    let socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+    // Each second passes instantly on the paused clock, and the close shows as a read of 0 bytes.
+    for _ in 0..60 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        match socket.try_read(&mut [0; 1]) {
+            Ok(0) => return,
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+            other => panic!("expected the connection to close, got {other:?}"),
+        }
+    }
+    panic!("the connection stayed open");
+}
