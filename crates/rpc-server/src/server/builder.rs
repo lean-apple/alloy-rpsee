@@ -252,14 +252,7 @@ where
             let connection = hyper.serve_connection_with_upgrades(TokioIo::new(socket), service);
             let connection = graceful.watch(connection.into_owned());
             tasks.spawn(async move {
-                // hyper's header timeout starts only once it has read enough to choose between
-                // HTTP/1 and HTTP/2, so it misses a connection that sends nothing.
-                let no_request = async {
-                    let first = request_received.notified();
-                    if tokio::time::timeout(FIRST_REQUEST_TIMEOUT, first).await.is_ok() {
-                        future::pending::<()>().await;
-                    }
-                };
+                let no_request = no_request_within(&request_received);
                 match future::select(pin!(connection), pin!(no_request)).await {
                     Either::Left((Err(err), _)) => tracing::debug!(%err, "HTTP connection failed"),
                     Either::Left((Ok(()), _)) => {}
@@ -380,7 +373,15 @@ where
     }
 }
 
-// Signals arrival before Tower readiness can delay a received request.
+// Completes if no request arrives in time, which hyper's header timeout misses before it detects
+// the protocol.
+async fn no_request_within(request_received: &Notify) {
+    if tokio::time::timeout(FIRST_REQUEST_TIMEOUT, request_received.notified()).await.is_ok() {
+        future::pending::<()>().await;
+    }
+}
+
+// Signals each request as hyper receives it, before tower's readiness check can hold it back.
 fn notify_on_request<S, R, B>(
     service: S,
     request_received: Arc<Notify>,
