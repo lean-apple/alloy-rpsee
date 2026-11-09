@@ -34,11 +34,12 @@ tokio-tungstenite = { workspace = true, optional = true }
 tower = { workspace = true, features = ["util"], optional = true }
 
 [dev-dependencies]
+alloy-rpc-macros.workspace = true
 http-body-util.workspace = true
 hyper = { workspace = true, features = ["client"] }
 hyper-util = { workspace = true, features = ["client-legacy", "http1", "tokio"] }
 test-case.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
 tokio-tungstenite = { workspace = true, features = ["connect"] }
 tower.workspace = true
 
@@ -48,6 +49,10 @@ required-features = ["server"]
 
 [[test]]
 name = "ws"
+required-features = ["server"]
+
+[[example]]
+name = "node_server"
 required-features = ["server"]
 
 [features]
