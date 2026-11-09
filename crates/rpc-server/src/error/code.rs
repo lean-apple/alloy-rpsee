@@ -1,4 +1,11 @@
-//! The error codes the server answers with, from the JSON-RPC spec and the server's own limits.
+//! The error codes the server answers with.
+//!
+//! -32700 and -32600 to -32603 come from the [JSON-RPC 2.0 spec]. The server's own limits use the
+//! range the spec leaves to implementations, -32000 to -32099, with the codes jsonrpsee servers
+//! send, so clients see the same errors. [EIP-1474] gives -32005 and -32006 other meanings.
+//!
+//! [JSON-RPC 2.0 spec]: https://www.jsonrpc.org/specification#error_object
+//! [EIP-1474]: https://eips.ethereum.org/EIPS/eip-1474#error-codes
 
 use super::call::error_data;
 use alloy_json_rpc::ErrorPayload;
