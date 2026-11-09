@@ -46,7 +46,7 @@ use std::fmt;
 /// ```
 pub fn parse_params<T: DeserializeOwned>(params: Option<&RawValue>) -> Result<T, InvalidParams> {
     let params = params.map_or("[]", RawValue::get);
-    if params.starts_with('{') {
+    if !params.starts_with('[') {
         return Err(InvalidParams::NonArray);
     }
     // A `RawValue` holds exactly one JSON value, so nothing can trail it.
@@ -68,6 +68,15 @@ impl<'de, D: Deserializer<'de>> Deserializer<'de> for IgnoreExtraParams<D> {
         self.0.deserialize_seq(NoParams(visitor))
     }
 
+    // A method with one argument decodes into a one-field struct, which serde reads as a newtype.
+    fn deserialize_newtype_struct<V: Visitor<'de>>(
+        self,
+        _name: &'static str,
+        visitor: V,
+    ) -> Result<V::Value, D::Error> {
+        self.0.deserialize_seq(IgnoreExtraParams(visitor))
+    }
+
     fn deserialize_tuple<V: Visitor<'de>>(
         self,
         _len: usize,
@@ -87,7 +96,7 @@ impl<'de, D: Deserializer<'de>> Deserializer<'de> for IgnoreExtraParams<D> {
 
     forward_to_deserialize_any! {
         bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes byte_buf option
-        unit_struct newtype_struct seq map struct enum identifier ignored_any
+        unit_struct seq map struct enum identifier ignored_any
     }
 }
 
@@ -218,10 +227,25 @@ mod tests {
     #[test_case(Some(r#"[5]"#), "invalid argument 0: invalid type: integer `5`, expected a string" ; "wrong type")]
     #[test_case(Some(r#"["0xab", "x"]"#), "invalid argument 1: invalid type: string \"x\", expected u64" ; "second argument")]
     #[test_case(Some(r#"{"a":1}"#), "non-array args" ; "object")]
+    #[test_case(Some("true"), "non-array args" ; "boolean")]
+    #[test_case(Some("1"), "non-array args" ; "number")]
+    #[test_case(Some(r#""0xab""#), "non-array args" ; "string")]
     fn rejects(raw: Option<&str>, message: &str) {
         let err = ErrorPayload::from(parse::<Params>(raw).unwrap_err());
         assert_eq!((err.code, err.message.as_ref()), (-32602, message));
         assert!(err.data.is_none());
+    }
+
+    #[derive(Debug, PartialEq, Deserialize)]
+    struct One(u64);
+
+    #[test_case(Some("[1, 2]"), Ok(One(1)) ; "extra ignored")]
+    #[test_case(Some(r#"["x"]"#), Err("invalid argument 0: invalid type: string \"x\", expected u64") ; "wrong type")]
+    #[test_case(Some("[]"), Err("missing value for required argument 0") ; "missing")]
+    #[test_case(None, Err("missing value for required argument 0") ; "absent")]
+    fn one_field_struct_is_indexed(raw: Option<&str>, expected: Result<One, &str>) {
+        let result = parse::<One>(raw).map_err(|err| ErrorPayload::from(err).message.into_owned());
+        assert_eq!(result, expected.map_err(str::to_owned));
     }
 
     #[test]

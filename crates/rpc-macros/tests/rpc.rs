@@ -26,6 +26,9 @@ trait TestApi {
 
     #[method(name = "fail")]
     fn fail(&self) -> RpcResult<()>;
+
+    #[method(name = "one")]
+    fn one(&self, value: u64) -> RpcResult<u64>;
 }
 
 struct Test;
@@ -49,6 +52,10 @@ impl TestApiServer for Test {
 
     fn fail(&self) -> RpcResult<()> {
         Err(ErrorPayload::internal_error_message("failed".into()))
+    }
+
+    fn one(&self, value: u64) -> RpcResult<u64> {
+        Ok(value)
     }
 }
 
@@ -158,6 +165,29 @@ async fn required_param_is_required() {
         call("test_add", "[]").await,
         r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"missing value for required argument 0"}}"#
     );
+}
+
+#[tokio::test]
+async fn single_argument_errors_name_the_argument() {
+    assert_eq!(call("test_one", "[7]").await, result("7"));
+    assert_eq!(
+        call("test_one", r#"["bad"]"#).await,
+        r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"invalid argument 0: invalid type: string \"bad\", expected u64"}}"#
+    );
+    assert_eq!(
+        call("test_one", "[]").await,
+        r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"missing value for required argument 0"}}"#
+    );
+}
+
+#[tokio::test]
+async fn non_array_params_are_rejected() {
+    for params in ["true", "1", r#""x""#, r#"{"a":1}"#] {
+        assert_eq!(
+            call("test_add", params).await,
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"non-array args"}}"#
+        );
+    }
 }
 
 #[tokio::test]
