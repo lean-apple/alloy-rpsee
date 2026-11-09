@@ -1,7 +1,8 @@
 //! Method parameter decoding.
 //!
 //! Params are positional, as in geth. Trailing optional params may be left out and extra ones are
-//! ignored. For `struct Params(String, #[serde(default)] Option<u64>)`:
+//! ignored. A method without params takes `()`. For `struct Params(String, #[serde(default)]
+//! Option<u64>)`:
 //!
 //! ```text
 //! ["0xab", 5]       -> Params("0xab", Some(5))
@@ -50,7 +51,7 @@ pub fn parse_params<T: DeserializeOwned>(params: Option<&RawValue>) -> Result<T,
     .map_err(InvalidParams::from)
 }
 
-/// Lets a tuple or tuple struct decode an array longer than its fields, which serde rejects.
+// Lets a tuple or tuple struct decode an array longer than its fields, which serde rejects.
 struct IgnoreExtraParams<D>(D);
 
 impl<'de, D: Deserializer<'de>> Deserializer<'de> for IgnoreExtraParams<D> {
@@ -58,6 +59,10 @@ impl<'de, D: Deserializer<'de>> Deserializer<'de> for IgnoreExtraParams<D> {
 
     fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, D::Error> {
         self.0.deserialize_any(visitor)
+    }
+
+    fn deserialize_unit<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, D::Error> {
+        self.0.deserialize_seq(NoParams(visitor))
     }
 
     fn deserialize_tuple<V: Visitor<'de>>(
@@ -79,7 +84,7 @@ impl<'de, D: Deserializer<'de>> Deserializer<'de> for IgnoreExtraParams<D> {
 
     forward_to_deserialize_any! {
         bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes byte_buf option
-        unit unit_struct newtype_struct seq map struct enum identifier ignored_any
+        unit_struct newtype_struct seq map struct enum identifier ignored_any
     }
 }
 
@@ -94,6 +99,22 @@ impl<'de, V: Visitor<'de>> Visitor<'de> for IgnoreExtraParams<V> {
         let value = self.0.visit_seq(&mut seq)?;
         while seq.next_element::<IgnoredAny>()?.is_some() {}
         Ok(value)
+    }
+}
+
+// Lets `()` decode an array of any length, for a method without params.
+struct NoParams<V>(V);
+
+impl<'de, V: Visitor<'de>> Visitor<'de> for NoParams<V> {
+    type Value = V::Value;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.expecting(f)
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<V::Value, A::Error> {
+        while seq.next_element::<IgnoredAny>()?.is_some() {}
+        self.0.visit_unit()
     }
 }
 
@@ -126,6 +147,22 @@ mod tests {
     #[test]
     fn plain_tuple_ignores_extra_elements() {
         assert_eq!(parse::<(u64,)>(Some("[1, 2]")).unwrap(), (1,));
+    }
+
+    #[test_case(None ; "absent")]
+    #[test_case(Some("[]") ; "empty array")]
+    #[test_case(Some("[1, true]") ; "extra elements")]
+    fn unit_accepts_any_params(raw: Option<&str>) {
+        parse::<()>(raw).unwrap();
+    }
+
+    #[test]
+    fn unit_rejects_an_object() {
+        let err = ErrorPayload::from(parse::<()>(Some(r#"{"a":1}"#)).unwrap_err());
+        assert_eq!(
+            err.data.unwrap().get(),
+            r#""invalid type: map, expected unit at line 1 column 0""#
+        );
     }
 
     #[test_case(None ; "absent")]

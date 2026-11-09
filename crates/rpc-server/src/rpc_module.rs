@@ -1,0 +1,277 @@
+//! Typed method registration.
+
+use crate::{
+    MethodResponse, Methods, error::RegisterMethodError, methods::MethodCallback, parse_params,
+};
+use alloy_json_rpc::{ErrorPayload, Id};
+use futures_util::future::Either;
+use serde::{Serialize, de::DeserializeOwned};
+use std::{
+    future::{Future, ready},
+    ops::{Deref, DerefMut},
+    sync::Arc,
+};
+
+/// Methods that share a context, such as one RPC namespace.
+///
+/// A method takes its params as a type that decodes from positional params, see
+/// [`parse_params`]. Params that don't decode are answered with `-32602 Invalid params` without
+/// running the method. The module derefs to its [`Methods`].
+///
+/// # Examples
+///
+/// ```
+/// use alloy_rpc_server::{ErrorPayload, RpcModule};
+///
+/// # #[tokio::main(flavor = "current_thread")]
+/// # async fn main() {
+/// let mut module = RpcModule::new("0x1");
+/// module.register_method("eth_chainId", |(): (), id| Ok::<_, ErrorPayload>(*id)).unwrap();
+/// module
+///     .register_async_method("echo", |(s,): (String,), _| async move { Ok::<_, ErrorPayload>(s) })
+///     .unwrap();
+///
+/// let response = module.raw_json_request(r#"{"jsonrpc":"2.0","id":1,"method":"eth_chainId"}"#);
+/// assert_eq!(response.await, r#"{"jsonrpc":"2.0","id":1,"result":"0x1"}"#);
+///
+/// let response =
+///     module.raw_json_request(r#"{"jsonrpc":"2.0","id":2,"method":"echo","params":["hi"]}"#);
+/// assert_eq!(response.await, r#"{"jsonrpc":"2.0","id":2,"result":"hi"}"#);
+/// # }
+/// ```
+#[derive(Debug, Clone)]
+pub struct RpcModule<Context> {
+    // Shared by every method of the module.
+    ctx: Arc<Context>,
+    // The registered methods.
+    methods: Methods,
+}
+
+impl<Context> RpcModule<Context> {
+    /// Creates an empty module whose methods share `ctx`.
+    pub fn new(ctx: Context) -> Self {
+        Self { ctx: Arc::new(ctx), methods: Methods::new() }
+    }
+
+    /// Keeps the methods and drops the context type, so modules can be stored together.
+    pub fn remove_context(self) -> RpcModule<()> {
+        RpcModule { ctx: Arc::new(()), methods: self.methods }
+    }
+}
+
+impl<Context: Send + Sync + 'static> RpcModule<Context> {
+    /// Registers a method that answers without awaiting.
+    ///
+    /// It runs on the caller's task, so it must not block.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegisterMethodError::AlreadyRegistered`] if `method_name` is taken.
+    pub fn register_method<P, R, E, F>(
+        &mut self,
+        method_name: &'static str,
+        callback: F,
+    ) -> Result<&mut MethodCallback, RegisterMethodError>
+    where
+        P: DeserializeOwned,
+        R: Serialize,
+        E: Into<ErrorPayload>,
+        F: Fn(P, &Context) -> Result<R, E> + Send + Sync + 'static,
+    {
+        let ctx = self.ctx.clone();
+        let method = MethodCallback::new(move |id, params, max_response_size| {
+            let response = match parse_params::<P>(params) {
+                Ok(params) => respond(id, callback(params, &ctx), max_response_size),
+                Err(err) => MethodResponse::error(id, err),
+            };
+            Either::Left(ready(response))
+        });
+        self.methods.verify_and_insert(method_name, method)
+    }
+
+    /// Registers a method that returns a future.
+    ///
+    /// The params are decoded before the future is created, so it owns typed values rather than
+    /// the request body.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegisterMethodError::AlreadyRegistered`] if `method_name` is taken.
+    pub fn register_async_method<P, R, E, F, Fut>(
+        &mut self,
+        method_name: &'static str,
+        callback: F,
+    ) -> Result<&mut MethodCallback, RegisterMethodError>
+    where
+        P: DeserializeOwned,
+        R: Serialize,
+        E: Into<ErrorPayload>,
+        F: Fn(P, Arc<Context>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<R, E>> + Send + 'static,
+    {
+        let ctx = self.ctx.clone();
+        let method = MethodCallback::new(move |id, params, max_response_size| {
+            match parse_params::<P>(params) {
+                Ok(params) => {
+                    let call = callback(params, ctx.clone());
+                    Either::Right(Box::pin(
+                        async move { respond(id, call.await, max_response_size) },
+                    ))
+                }
+                Err(err) => Either::Left(ready(MethodResponse::error(id, err))),
+            }
+        });
+        self.methods.verify_and_insert(method_name, method)
+    }
+
+    /// Registers `alias` as another name for the method `existing`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegisterMethodError::MethodNotFound`] if `existing` isn't registered, or
+    /// [`RegisterMethodError::AlreadyRegistered`] if `alias` is taken.
+    pub fn register_alias(
+        &mut self,
+        alias: &'static str,
+        existing: &'static str,
+    ) -> Result<(), RegisterMethodError> {
+        let method =
+            self.method(existing).cloned().ok_or(RegisterMethodError::MethodNotFound(existing))?;
+        self.methods.verify_and_insert(alias, method)?;
+        Ok(())
+    }
+}
+
+impl<Context> Deref for RpcModule<Context> {
+    type Target = Methods;
+
+    fn deref(&self) -> &Methods {
+        &self.methods
+    }
+}
+
+impl<Context> DerefMut for RpcModule<Context> {
+    fn deref_mut(&mut self) -> &mut Methods {
+        &mut self.methods
+    }
+}
+
+impl<Context> From<RpcModule<Context>> for Methods {
+    fn from(module: RpcModule<Context>) -> Self {
+        module.methods
+    }
+}
+
+// The response to a method's result.
+fn respond<R: Serialize, E: Into<ErrorPayload>>(
+    id: Id,
+    result: Result<R, E>,
+    max_response_size: usize,
+) -> MethodResponse {
+    match result {
+        Ok(result) => MethodResponse::success(id, &result, max_response_size),
+        Err(err) => MethodResponse::error(id, err),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::value::RawValue;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const INVALID_PARAMS: &str = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"Invalid params","data":"invalid type: string \"x\", expected u64 at line 1 column 4"}}"#;
+
+    fn module() -> RpcModule<AtomicUsize> {
+        let mut module = RpcModule::new(AtomicUsize::new(0));
+        module
+            .register_method("double", |(n,): (u64,), calls: &AtomicUsize| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                n.checked_mul(2)
+                    .ok_or_else(|| ErrorPayload::internal_error_message("overflow".into()))
+            })
+            .unwrap();
+        module
+            .register_async_method("triple", |(n,): (u64,), calls: Arc<AtomicUsize>| async move {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Ok::<_, ErrorPayload>(n * 3)
+            })
+            .unwrap();
+        module
+    }
+
+    fn call(method: &str, params: &str) -> String {
+        format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{params}}}"#)
+    }
+
+    #[tokio::test]
+    async fn methods_get_decoded_params_and_the_context() {
+        let module = module();
+        assert_eq!(
+            module.raw_json_request(&call("double", "[2]")).await,
+            r#"{"jsonrpc":"2.0","id":1,"result":4}"#
+        );
+        assert_eq!(
+            module.raw_json_request(&call("triple", "[2]")).await,
+            r#"{"jsonrpc":"2.0","id":1,"result":6}"#
+        );
+        assert_eq!(module.ctx.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn invalid_params_skip_the_method() {
+        let module = module();
+        for method in ["double", "triple"] {
+            assert_eq!(module.raw_json_request(&call(method, r#"["x"]"#)).await, INVALID_PARAMS);
+        }
+        assert_eq!(module.ctx.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn method_error_is_answered() {
+        assert_eq!(
+            module().raw_json_request(&call("double", &format!("[{}]", u64::MAX))).await,
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"overflow"}}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn response_is_bounded() {
+        let raw = RawValue::from_string("[2]".to_owned()).unwrap();
+        let response = module().method("double").unwrap().call(Id::Number(1), Some(&raw), 16);
+        assert_eq!(
+            response.await.into_json(),
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32008,"message":"Response is too big","data":"Exceeded max limit of 16"}}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn alias_calls_the_same_method() {
+        let mut module = module();
+        module.register_alias("twice", "double").unwrap();
+        assert_eq!(
+            module.raw_json_request(&call("twice", "[2]")).await,
+            r#"{"jsonrpc":"2.0","id":1,"result":4}"#
+        );
+    }
+
+    #[test]
+    fn alias_needs_a_free_name_and_an_existing_method() {
+        let mut module = module();
+        assert_eq!(
+            module.register_alias("twice", "missing"),
+            Err(RegisterMethodError::MethodNotFound("missing"))
+        );
+        assert_eq!(
+            module.register_alias("triple", "double"),
+            Err(RegisterMethodError::AlreadyRegistered("triple"))
+        );
+    }
+
+    #[test]
+    fn remove_context_keeps_the_methods() {
+        let mut names = module().remove_context().method_names().collect::<Vec<_>>();
+        names.sort_unstable();
+        assert_eq!(names, ["double", "triple"]);
+    }
+}

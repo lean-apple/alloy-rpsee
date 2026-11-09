@@ -19,9 +19,6 @@ use std::borrow::Cow;
 /// assert_eq!(call.id, Some(Id::None));
 /// # Ok::<_, serde_json::Error>(())
 /// ```
-///
-/// [`alloy_json_rpc::Request`] can't be reused: it is a client type that reads both cases as
-/// [`Id::None`], requires `params`, and rejects unknown members.
 #[derive(Debug, Deserialize)]
 pub struct Request<'a> {
     /// Must be `"2.0"`.
@@ -46,8 +43,8 @@ pub(crate) enum Version {
     V2,
 }
 
-/// Called only when `id` is present, so `null` becomes `Some(Id::None)`. A missing `id` takes
-/// `#[serde(default)]` instead.
+// Called only when `id` is present, so `null` becomes `Some(Id::None)`. A missing `id` takes
+// `#[serde(default)]` instead.
 fn deserialize_present_id<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<Id>, D::Error> {
@@ -101,7 +98,7 @@ mod tests {
             err.to_string(),
             "unknown field `extra`, expected one of `id`, `params`, `method`, `jsonrpc` at line 1 column 56"
         );
-        assert!(parse(body).is_ok());
+        assert_eq!(parse(body).unwrap().id, Some(Id::Number(1)));
     }
 
     #[test]

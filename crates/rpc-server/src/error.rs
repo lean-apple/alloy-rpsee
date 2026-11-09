@@ -46,6 +46,17 @@ impl From<OversizedResponse> for ErrorPayload {
     }
 }
 
+/// A method couldn't be registered.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum RegisterMethodError {
+    /// The name is taken.
+    #[error("method `{0}` is already registered")]
+    AlreadyRegistered(&'static str),
+    /// An alias points to a method that isn't registered.
+    #[error("method `{0}` is not registered")]
+    MethodNotFound(&'static str),
+}
+
 // A message as the JSON string in an error's `data`.
 fn error_data(message: &str) -> Option<Box<RawValue>> {
     // Never panic while answering a bad request, even though a string always serializes.
