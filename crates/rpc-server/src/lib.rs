@@ -1,4 +1,4 @@
-//! JSON-RPC 2.0 server built on Alloy's JSON-RPC types.
+#![doc = include_str!("../README.md")]
 
 pub use alloy_json_rpc::{ErrorPayload, Id};
 
