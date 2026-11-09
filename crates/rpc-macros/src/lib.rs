@@ -1,8 +1,8 @@
 //! Server traits for `alloy-rpc-server`.
 //!
 //! `#[rpc(server, namespace = "..")]` turns an RPC trait into a `<Trait>Server` trait that
-//! implementations write as usual, plus an `into_rpc` method that registers each method on an
-//! `RpcModule`, decoding its positional params into the method's arguments.
+//! implementations write as usual, plus an `into_rpc` method that registers each method and
+//! subscription on an `RpcModule`, decoding its positional params into the method's arguments.
 
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TokenStream2};
@@ -10,7 +10,8 @@ use quote::{format_ident, quote};
 use std::collections::HashSet;
 use syn::{
     Attribute, FnArg, Ident, ItemTrait, LitStr, ReturnType, Signature, TraitItem, TraitItemFn,
-    Type, parse_macro_input, parse_quote, punctuated::Punctuated, spanned::Spanned, visit::Visit,
+    Type, meta::ParseNestedMeta, parse_macro_input, parse_quote, punctuated::Punctuated,
+    spanned::Spanned, visit::Visit,
 };
 
 /// Generates `<Trait>Server` and its `into_rpc` from an RPC trait.
@@ -123,28 +124,30 @@ impl RpcTrait {
         })
     }
 
-    // `into_rpc`, which registers every method and alias. Names are checked here, so registering
-    // can't fail at runtime.
+    // `into_rpc`, which registers every method, alias and subscription. Names are checked here, so
+    // registering can't fail at runtime.
     fn render_into_rpc(&self) -> syn::Result<TokenStream2> {
         let mut names = HashSet::new();
         let mut registrations = Vec::new();
         for method in &self.methods {
-            let rpc_name = format!("{}_{}", self.namespace, method.name);
-            for name in std::iter::once(&rpc_name).chain(&method.aliases) {
+            let rpc_name = self.rpc_name(&method.name);
+            let taken = match &method.kind {
+                ItemKind::Method { aliases, .. } => {
+                    std::iter::once(rpc_name.clone()).chain(aliases.iter().cloned()).collect()
+                }
+                ItemKind::Subscription { unsubscribe, .. } => {
+                    vec![rpc_name.clone(), self.rpc_name(unsubscribe)]
+                }
+            };
+            for name in taken {
                 if !names.insert(name.clone()) {
                     let message = format!("`{name}` is registered twice");
                     return Err(syn::Error::new(method.sig.ident.span(), message));
                 }
             }
-            registrations.push(method.render_registration(&self.item, &rpc_name));
-            registrations.extend(method.aliases.iter().map(|alias| {
-                quote! {
-                    rpc.register_alias(#alias, #rpc_name)
-                        .expect("aliases target a method registered just before");
-                }
-            }));
+            registrations.push(method.render_registration(self, &rpc_name));
         }
-        let bounds = self.generic_bounds();
+        let bounds = self.type_param_bounds();
         Ok(quote! {
             /// Collects all the methods of the trait into one `RpcModule`.
             fn into_rpc(self) -> ::alloy_rpc_server::RpcModule<Self> where #(#bounds,)* {
@@ -155,28 +158,36 @@ impl RpcTrait {
         })
     }
 
+    // `<namespace>_<name>`, the name a method is registered as.
+    fn rpc_name(&self, name: &str) -> String {
+        format!("{}_{name}", self.namespace)
+    }
+
     // `Send + Sync + 'static` for every type parameter, plus `DeserializeOwned` when it appears in
-    // an argument and `Serialize` when it appears in a return type.
-    fn generic_bounds(&self) -> Vec<TokenStream2> {
+    // an argument and `Serialize` when it appears in a return type or a subscription item.
+    fn type_param_bounds(&self) -> Vec<TokenStream2> {
         let params = type_param_idents(&self.item);
         let mut used = UsedParams { params: &params, found: HashSet::new() };
-        for ty in self.methods.iter().flat_map(|method| &method.arg_tys) {
+        for ty in self.methods.iter().flat_map(|method| &method.arg_types) {
             used.visit_type(ty);
         }
-        let in_args = std::mem::take(&mut used.found);
+        let deserialized = std::mem::take(&mut used.found);
         for method in &self.methods {
-            used.visit_return_type(&method.sig.output);
+            match &method.kind {
+                ItemKind::Method { .. } => used.visit_return_type(&method.sig.output),
+                ItemKind::Subscription { item, .. } => used.visit_type(item),
+            }
         }
-        let in_returns = used.found;
+        let serialized = used.found;
         self.item
             .generics
             .type_params()
             .map(|param| {
                 let ident = &param.ident;
-                let de = in_args
+                let de = deserialized
                     .contains(ident)
                     .then(|| quote!(+ ::alloy_rpc_server::__private::serde::de::DeserializeOwned));
-                let ser = in_returns
+                let ser = serialized
                     .contains(ident)
                     .then(|| quote!(+ ::alloy_rpc_server::__private::serde::Serialize));
                 quote!(#ident: Send + Sync + 'static #de #ser)
@@ -185,59 +196,69 @@ impl RpcTrait {
     }
 }
 
-// A parsed `#[method]`.
+// A parsed `#[method]` or `#[subscription]`.
 struct RpcMethod {
     // The name without the namespace.
     name: String,
-    // Extra names, registered as written.
-    aliases: Vec<String>,
-    // Whether the method runs on the blocking pool.
-    blocking: bool,
+    // What the item registers as.
+    kind: ItemKind,
     // The signature as declared.
     sig: Signature,
-    // The attributes other than `#[method]`, such as docs.
+    // The attributes other than `#[method]` or `#[subscription]`, such as docs.
     attrs: Vec<Attribute>,
     // The argument types after `&self`, in order.
-    arg_tys: Vec<Type>,
+    arg_types: Vec<Type>,
+}
+
+// What an RPC item registers as.
+enum ItemKind {
+    // A method answering calls.
+    Method {
+        // Extra names, registered as written.
+        aliases: Vec<String>,
+        // Whether the method runs on the blocking pool.
+        blocking: bool,
+    },
+    // A subscription sending notifications.
+    Subscription {
+        // The notification method name without the namespace, the subscription's own if `None`.
+        notification: Option<String>,
+        // The unsubscribe method name without the namespace.
+        unsubscribe: String,
+        // The type each notification carries.
+        item: Box<Type>,
+    },
 }
 
 impl RpcMethod {
-    // Reads the `#[method]` attribute and checks the signature.
+    // Reads the `#[method]` or `#[subscription]` attribute and checks the signature.
     fn parse(mut method: TraitItemFn) -> syn::Result<Self> {
-        if let Some(attr) = method.attrs.iter().find(|attr| attr.path().is_ident("subscription")) {
-            return Err(syn::Error::new(attr.meta.span(), "`#[subscription]` isn't supported yet"));
-        }
         if let Some(default) = &method.default {
             return Err(syn::Error::new(default.span(), "RPC methods can't have a default body"));
         }
-        let position =
-            method.attrs.iter().position(|attr| attr.path().is_ident("method")).ok_or_else(
-                || syn::Error::new(method.sig.span(), "missing `#[method(name = \"..\")]`"),
-            )?;
+        let position = method
+            .attrs
+            .iter()
+            .position(|attr| attr.path().is_ident("method") || attr.path().is_ident("subscription"))
+            .ok_or_else(|| {
+                syn::Error::new(method.sig.span(), "missing `#[method(name = \"..\")]`")
+            })?;
         let attr = method.attrs.remove(position);
-
-        let (mut name, mut aliases, mut blocking) = (None, Vec::new(), false);
-        attr.parse_nested_meta(|meta| {
-            if meta.path.is_ident("name") {
-                name = Some(meta.value()?.parse::<LitStr>()?.value());
-            } else if meta.path.is_ident("aliases") {
-                let value = meta.value()?;
-                let content;
-                syn::bracketed!(content in value);
-                let list = Punctuated::<LitStr, syn::Token![,]>::parse_terminated(&content)?;
-                aliases = list.iter().map(LitStr::value).collect();
-            } else if meta.path.is_ident("blocking") {
-                blocking = true;
-            } else {
-                return Err(meta.error("expected `name`, `aliases` or `blocking`"));
+        let (name, kind) = if attr.path().is_ident("method") {
+            let MethodArgs { name, aliases, blocking } = MethodArgs::parse(&attr)?;
+            if blocking && method.sig.asyncness.is_some() {
+                let message = "`blocking` methods can't be `async`";
+                return Err(syn::Error::new(method.sig.span(), message));
             }
-            Ok(())
-        })?;
-        let name =
-            name.ok_or_else(|| syn::Error::new(attr.meta.span(), "missing `name = \"..\"`"))?;
-        if blocking && method.sig.asyncness.is_some() {
-            return Err(syn::Error::new(method.sig.span(), "`blocking` methods can't be `async`"));
-        }
+            (name, ItemKind::Method { aliases, blocking })
+        } else {
+            let SubscriptionArgs { name, notification, unsubscribe, item } =
+                SubscriptionArgs::parse(&attr)?;
+            if method.sig.asyncness.is_none() {
+                return Err(syn::Error::new(method.sig.span(), "subscriptions must be `async`"));
+            }
+            (name, ItemKind::Subscription { notification, unsubscribe, item })
+        };
 
         let mut inputs = method.sig.inputs.iter();
         let takes_ref = matches!(
@@ -248,7 +269,7 @@ impl RpcMethod {
         if !takes_ref {
             return Err(syn::Error::new(method.sig.span(), "RPC methods take `&self`"));
         }
-        let arg_tys = inputs
+        let arg_types = inputs
             .map(|input| match input {
                 FnArg::Typed(arg) => Ok((*arg.ty).clone()),
                 FnArg::Receiver(receiver) => {
@@ -256,13 +277,17 @@ impl RpcMethod {
                 }
             })
             .collect::<syn::Result<_>>()?;
-        Ok(Self { name, aliases, blocking, sig: method.sig, attrs: method.attrs, arg_tys })
+        Ok(Self { name, kind, sig: method.sig, attrs: method.attrs, arg_types })
     }
 
     // The method in the server trait, with `async fn` written as `fn .. -> impl Future + Send`
-    // so the future can be spawned.
+    // so the future can be spawned. A subscription also takes the call's pending sink.
     fn render_signature(&self) -> TokenStream2 {
         let mut sig = self.sig.clone();
+        if let ItemKind::Subscription { .. } = self.kind {
+            sig.inputs
+                .insert(1, parse_quote!(pending: ::alloy_rpc_server::PendingSubscriptionSink));
+        }
         if sig.asyncness.take().is_some() {
             let output = match &sig.output {
                 ReturnType::Default => quote!(()),
@@ -280,7 +305,7 @@ impl RpcMethod {
     // trailing `Option` argument gets `#[serde(default)]`, so it may be left out. A method without
     // arguments takes `()` instead.
     fn render_params(&self, item: &ItemTrait) -> Option<TokenStream2> {
-        if self.arg_tys.is_empty() {
+        if self.arg_types.is_empty() {
             return None;
         }
         let ident = self.params_ident(item);
@@ -296,9 +321,9 @@ impl RpcMethod {
                     !mentioned.found.is_empty() && mentioned.found.is_subset(&used)
                 },
             );
-        let optional = self.arg_tys.iter().rev().take_while(|ty| is_option(ty)).count();
-        let required = self.arg_tys.len() - optional;
-        let fields = self.arg_tys.iter().enumerate().map(|(i, ty)| {
+        let optional = self.arg_types.iter().rev().take_while(|ty| is_option(ty)).count();
+        let required = self.arg_types.len() - optional;
+        let fields = self.arg_types.iter().enumerate().map(|(i, ty)| {
             let default = (i >= required).then(|| quote!(#[serde(default)]));
             quote!(#default #ty)
         });
@@ -329,16 +354,18 @@ impl RpcMethod {
     fn used_params(&self, item: &ItemTrait) -> HashSet<Ident> {
         let params = type_param_idents(item);
         let mut used = UsedParams { params: &params, found: HashSet::new() };
-        for ty in &self.arg_tys {
+        for ty in &self.arg_types {
             used.visit_type(ty);
         }
         used.found
     }
 
     // The registration of the method in `into_rpc`.
-    fn render_registration(&self, item: &ItemTrait, rpc_name: &str) -> TokenStream2 {
+    fn render_registration(&self, rpc_trait: &RpcTrait, rpc_name: &str) -> TokenStream2 {
+        let item = &rpc_trait.item;
         let ident = &self.sig.ident;
-        let args = (0..self.arg_tys.len()).map(|i| format_ident!("__param{i}")).collect::<Vec<_>>();
+        let args =
+            (0..self.arg_types.len()).map(|i| format_ident!("__param{i}")).collect::<Vec<_>>();
         let (pattern, ty) = if args.is_empty() {
             (quote!(()), quote!(()))
         } else {
@@ -351,13 +378,32 @@ impl RpcMethod {
                 .filter(|param| used.contains(*param));
             (quote!(#params(#(#args),*)), quote!(#params<#(#generics),*>))
         };
+        let (aliases, blocking) = match &self.kind {
+            ItemKind::Method { aliases, blocking } => (aliases, *blocking),
+            ItemKind::Subscription { notification, unsubscribe, .. } => {
+                let notification =
+                    rpc_trait.rpc_name(notification.as_deref().unwrap_or(&self.name));
+                let unsubscribe = rpc_trait.rpc_name(unsubscribe);
+                return quote! {
+                    rpc.register_subscription(
+                        #rpc_name,
+                        #notification,
+                        #unsubscribe,
+                        |#pattern: #ty, pending, context| async move {
+                            context.as_ref().#ident(pending, #(#args),*).await
+                        },
+                    )
+                    .expect("method names are checked for duplicates at compile time");
+                };
+            }
+        };
         let register = if self.sig.asyncness.is_some() {
             quote! {
                 rpc.register_async_method(#rpc_name, |#pattern: #ty, context| async move {
                     context.as_ref().#ident(#(#args),*).await
                 })
             }
-        } else if self.blocking {
+        } else if blocking {
             quote! {
                 rpc.register_blocking_method(#rpc_name, |#pattern: #ty, context| {
                     context.#ident(#(#args),*)
@@ -368,8 +414,103 @@ impl RpcMethod {
                 rpc.register_method(#rpc_name, |#pattern: #ty, context| context.#ident(#(#args),*))
             }
         };
-        quote! { #register.expect("method names are checked for duplicates at compile time"); }
+        let aliases = aliases.iter().map(|alias| {
+            quote! {
+                rpc.register_alias(#alias, #rpc_name)
+                    .expect("aliases target a method registered just before");
+            }
+        });
+        quote! {
+            #register.expect("method names are checked for duplicates at compile time");
+            #(#aliases)*
+        }
     }
+}
+
+// The arguments of `#[method(name = "..", aliases = [".."], blocking)]`.
+struct MethodArgs {
+    // The name without the namespace.
+    name: String,
+    // Extra names, registered as written.
+    aliases: Vec<String>,
+    // Whether the method runs on the blocking pool.
+    blocking: bool,
+}
+
+impl MethodArgs {
+    // Reads the attribute's arguments.
+    fn parse(attr: &Attribute) -> syn::Result<Self> {
+        let (mut name, mut aliases, mut blocking) = (None, Vec::new(), false);
+        attr.parse_nested_meta(|meta| {
+            match meta.path.get_ident().map(Ident::to_string).as_deref() {
+                Some("name") => name = Some(parse_string(&meta)?),
+                Some("aliases") => aliases = parse_strings(&meta)?,
+                Some("blocking") => blocking = true,
+                _ => return Err(meta.error("expected `name`, `aliases` or `blocking`")),
+            }
+            Ok(())
+        })?;
+        Ok(Self { name: require(attr, name, "name = \"..\"")?, aliases, blocking })
+    }
+}
+
+// The arguments of `#[subscription(name = ".." => "..", unsubscribe = "..", item = T)]`, where
+// `=> ".."` names the notifications.
+struct SubscriptionArgs {
+    // The name without the namespace.
+    name: String,
+    // The notification method name without the namespace, if it differs.
+    notification: Option<String>,
+    // The unsubscribe method name without the namespace.
+    unsubscribe: String,
+    // The type each notification carries.
+    item: Box<Type>,
+}
+
+impl SubscriptionArgs {
+    // Reads the attribute's arguments.
+    fn parse(attr: &Attribute) -> syn::Result<Self> {
+        let (mut name, mut notification, mut unsubscribe, mut item) = (None, None, None, None);
+        attr.parse_nested_meta(|meta| {
+            match meta.path.get_ident().map(Ident::to_string).as_deref() {
+                Some("name") => {
+                    name = Some(parse_string(&meta)?);
+                    if meta.input.parse::<Option<syn::Token![=>]>>()?.is_some() {
+                        notification = Some(meta.input.parse::<LitStr>()?.value());
+                    }
+                }
+                Some("unsubscribe") => unsubscribe = Some(parse_string(&meta)?),
+                Some("item") => item = Some(Box::new(meta.value()?.parse::<Type>()?)),
+                _ => return Err(meta.error("expected `name`, `unsubscribe` or `item`")),
+            }
+            Ok(())
+        })?;
+        Ok(Self {
+            name: require(attr, name, "name = \"..\"")?,
+            notification,
+            unsubscribe: require(attr, unsubscribe, "unsubscribe = \"..\"")?,
+            item: require(attr, item, "item = ..")?,
+        })
+    }
+}
+
+// The string of `key = ".."`.
+fn parse_string(meta: &ParseNestedMeta<'_>) -> syn::Result<String> {
+    Ok(meta.value()?.parse::<LitStr>()?.value())
+}
+
+// The strings of `key = ["..", ".."]`.
+fn parse_strings(meta: &ParseNestedMeta<'_>) -> syn::Result<Vec<String>> {
+    let value = meta.value()?;
+    let content;
+    syn::bracketed!(content in value);
+    let list = Punctuated::<LitStr, syn::Token![,]>::parse_terminated(&content)?;
+    Ok(list.iter().map(LitStr::value).collect())
+}
+
+// The value of a required `key`, or an error pointing at the attribute.
+fn require<T>(attr: &Attribute, value: Option<T>, key: &str) -> syn::Result<T> {
+    value.ok_or_else(|| syn::Error::new(attr.meta.span(), format!("missing `{key}`")))
 }
 
 // The idents of the trait's type parameters.

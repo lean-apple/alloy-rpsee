@@ -1,0 +1,5 @@
+error: missing `item = ..`
+ --> tests/ui/subscription_missing_item.rs:3:7
+  |
+3 |     #[subscription(name = "subscribe", unsubscribe = "unsubscribe")]
+  |       ^^^^^^^^^^^^
