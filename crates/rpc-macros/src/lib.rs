@@ -432,7 +432,8 @@ struct SubscriptionArgs {
     name: String,
     // The notification method name without the namespace, if it differs.
     notification: Option<String>,
-    // The unsubscribe method name without the namespace.
+    // The unsubscribe method name without the namespace, `unsubscribeX` for `subscribeX` unless
+    // given.
     unsubscribe: String,
     // The type each notification carries.
     item: Box<Type>,
@@ -456,10 +457,14 @@ impl SubscriptionArgs {
             }
             Ok(())
         })?;
+        let name = require(attr, name, "name = \"..\"")?;
+        let unsubscribe = unsubscribe.or_else(|| {
+            name.strip_prefix("subscribe").map(|suffix| format!("unsubscribe{suffix}"))
+        });
         Ok(Self {
-            name: require(attr, name, "name = \"..\"")?,
-            notification,
             unsubscribe: require(attr, unsubscribe, "unsubscribe = \"..\"")?,
+            name,
+            notification,
             item: require(attr, item, "item = ..")?,
         })
     }

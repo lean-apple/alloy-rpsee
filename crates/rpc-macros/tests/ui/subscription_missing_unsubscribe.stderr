@@ -1,5 +1,5 @@
 error: missing `unsubscribe = ".."`
  --> tests/ui/subscription_missing_unsubscribe.rs:3:7
   |
-3 |     #[subscription(name = "subscribe", item = u64)]
+3 |     #[subscription(name = "peerEvents", item = u64)]
   |       ^^^^^^^^^^^^
