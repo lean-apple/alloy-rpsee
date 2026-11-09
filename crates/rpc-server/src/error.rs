@@ -10,6 +10,15 @@ const MAX_ERROR_DATA_LEN: usize = 1024;
 // A response exceeded the size limit.
 const OVERSIZED_RESPONSE_CODE: i64 = -32008;
 
+// The server doesn't accept batches.
+const BATCHES_NOT_SUPPORTED_CODE: i64 = -32005;
+
+// A batch has more entries than allowed.
+const TOO_BIG_BATCH_REQUEST_CODE: i64 = -32010;
+
+// A batch's responses exceeded the size limit.
+const TOO_BIG_BATCH_RESPONSE_CODE: i64 = -32011;
+
 /// The params of a call don't match the method's arguments.
 ///
 /// Converts into `-32602 Invalid params` carrying the decoder's message.
@@ -55,6 +64,59 @@ pub enum RegisterMethodError {
     /// An alias points to a method that isn't registered.
     #[error("method `{0}` is not registered")]
     MethodNotFound(&'static str),
+}
+
+// A batch that can't be run. Each converts into the error answered with a `null` id.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum BatchError {
+    // Batches are disabled.
+    #[error("Batched requests are not supported by this server")]
+    NotSupported,
+    // The body isn't a JSON array.
+    #[error("Parse error")]
+    Parse,
+    // The batch has more entries than allowed.
+    #[error("The batch request was too large")]
+    TooBig {
+        // The most entries allowed.
+        limit: usize,
+    },
+}
+
+impl From<BatchError> for ErrorPayload {
+    fn from(err: BatchError) -> Self {
+        match err {
+            BatchError::NotSupported => Self {
+                code: BATCHES_NOT_SUPPORTED_CODE,
+                message: Cow::Owned(err.to_string()),
+                data: None,
+            },
+            BatchError::Parse => Self::parse_error(),
+            BatchError::TooBig { limit } => Self {
+                code: TOO_BIG_BATCH_REQUEST_CODE,
+                message: Cow::Owned(err.to_string()),
+                data: error_data(&format!("Exceeded max limit of {limit}")),
+            },
+        }
+    }
+}
+
+// A batch's responses exceeded their size limit. Converts into `-32011` naming the limit.
+#[derive(Debug, thiserror::Error)]
+#[error("Exceeded max limit of {limit}")]
+pub(crate) struct OversizedBatchResponse {
+    // The size limit in bytes.
+    pub(crate) limit: usize,
+}
+
+impl From<OversizedBatchResponse> for ErrorPayload {
+    fn from(err: OversizedBatchResponse) -> Self {
+        Self {
+            code: TOO_BIG_BATCH_RESPONSE_CODE,
+            message: Cow::Borrowed("The batch response was too large"),
+            data: error_data(&err.to_string()),
+        }
+    }
 }
 
 // A message as the JSON string in an error's `data`.

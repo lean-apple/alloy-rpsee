@@ -36,17 +36,17 @@ const INTERNAL_ERROR_JSON: &str =
 pub struct MethodResponse {
     // The response as sent on the wire.
     json: String,
-    // Whether `json` holds a result or an error.
+    // What `json` answers.
     kind: Kind,
 }
 
 impl MethodResponse {
-    /// Serializes a successful response to `id`, at most `max_len` bytes long.
+    /// Serializes a successful response to `id`, at most `max_response_size` bytes long.
     ///
     /// A larger response becomes `-32008 Response is too big`, and a result that fails to serialize
     /// becomes `-32603 Internal error`.
-    pub fn success<T: Serialize + ?Sized>(id: Id, result: &T, max_len: usize) -> Self {
-        let mut writer = BoundedWriter::new(max_len);
+    pub fn success<T: Serialize + ?Sized>(id: Id, result: &T, max_response_size: usize) -> Self {
+        let mut writer = BoundedWriter::new(max_response_size);
         let response = Response { id, payload: ResponsePayload::<&T, ()>::Success(result) };
         match serde_json::to_writer(&mut writer, &response) {
             Ok(()) => match String::from_utf8(writer.into_bytes()) {
@@ -56,7 +56,7 @@ impl MethodResponse {
             },
             // The writer's only IO error is the size limit.
             Err(err) if err.is_io() => {
-                Self::error(response.id, OversizedResponse { limit: max_len })
+                Self::error(response.id, OversizedResponse { limit: max_response_size })
             }
             Err(err) => {
                 tracing::error!(%err, "failed to serialize an RPC result");
@@ -79,14 +79,29 @@ impl MethodResponse {
         Self { json, kind: Kind::Error }
     }
 
+    /// The answer to a notification, which sends nothing.
+    pub const fn notification() -> Self {
+        Self { json: String::new(), kind: Kind::Notification }
+    }
+
+    // A batch's joined responses.
+    pub(crate) const fn from_batch(json: String) -> Self {
+        Self { json, kind: Kind::Batch }
+    }
+
     /// Returns `true` unless the response is an error.
     pub const fn is_success(&self) -> bool {
-        matches!(self.kind, Kind::Success)
+        !self.is_error()
     }
 
     /// Returns `true` if the response is an error.
     pub const fn is_error(&self) -> bool {
         matches!(self.kind, Kind::Error)
+    }
+
+    /// Returns `true` for the answer to a notification, which the transport doesn't send.
+    pub const fn is_notification(&self) -> bool {
+        matches!(self.kind, Kind::Notification)
     }
 
     /// Takes the serialized JSON.
@@ -95,13 +110,17 @@ impl MethodResponse {
     }
 }
 
-// Whether a response carries a result or an error.
+// What a response answers.
 #[derive(Debug)]
 enum Kind {
-    // Carries a `result`.
+    // A call, with a `result`.
     Success,
-    // Carries an `error`.
+    // A call, with an `error`.
     Error,
+    // A notification, with nothing to send.
+    Notification,
+    // A batch, with an array of responses.
+    Batch,
 }
 
 // An error response that omits an empty `data`, unlike Alloy's.
