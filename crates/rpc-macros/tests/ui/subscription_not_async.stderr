@@ -1,0 +1,5 @@
+error: subscriptions must be `async`
+ --> tests/ui/subscription_not_async.rs:4:5
+  |
+4 |     fn s(&self) -> alloy_rpc_server::SubscriptionResult;
+  |     ^^

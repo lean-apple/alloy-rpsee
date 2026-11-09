@@ -1,9 +1,14 @@
 //! End-to-end tests of the code `#[rpc]` generates.
 
 use alloy_rpc_macros::rpc;
-use alloy_rpc_server::{ErrorPayload, RpcResult};
+use alloy_rpc_server::{
+    BatchRequestConfig, Connection, ConnectionId, ErrorPayload, IdProvider, MethodResponse,
+    RpcResult, RpcService, SubscriptionId, SubscriptionMessage, SubscriptionResult,
+    handle_rpc_call,
+};
 use serde::{Serialize, de::DeserializeOwned};
-use std::marker::PhantomData;
+use std::{marker::PhantomData, sync::Arc};
+use tokio::sync::mpsc;
 
 #[rpc(server, namespace = "test")]
 trait TestApi {
@@ -65,6 +70,65 @@ where
     }
 }
 
+#[rpc(server, namespace = "sub")]
+trait SubApi<T> {
+    #[subscription(name = "subscribe" => "subscription", unsubscribe = "unsubscribe", item = T)]
+    async fn subscribe(&self, start: u64, step: Option<u64>) -> SubscriptionResult;
+
+    #[subscription(name = "peerEvents", unsubscribe = "peerEvents_unsubscribe", item = String)]
+    async fn peer_events(&self) -> SubscriptionResult;
+}
+
+struct Sub;
+
+impl SubApiServer<u64> for Sub {
+    async fn subscribe(
+        &self,
+        pending: alloy_rpc_server::PendingSubscriptionSink,
+        start: u64,
+        step: Option<u64>,
+    ) -> SubscriptionResult {
+        let sink = pending.accept().await?;
+        for item in [start, start.saturating_add(step.unwrap_or(1))] {
+            sink.send(SubscriptionMessage::new(sink.method_name(), sink.subscription_id(), &item)?)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn peer_events(
+        &self,
+        pending: alloy_rpc_server::PendingSubscriptionSink,
+    ) -> SubscriptionResult {
+        let sink = pending.accept().await?;
+        sink.send(SubscriptionMessage::new(sink.method_name(), sink.subscription_id(), &"added")?)
+            .await?;
+        sink.closed().await;
+        Ok(())
+    }
+}
+
+// Ids every subscription `7`, so tests know it.
+#[derive(Debug)]
+struct Seven;
+
+impl IdProvider for Seven {
+    fn next_id(&self) -> SubscriptionId {
+        SubscriptionId::Num(7)
+    }
+}
+
+// A connection serving `Sub`, and the messages it sends.
+fn connection() -> (RpcService, mpsc::Receiver<String>) {
+    let (sender, received) = mpsc::channel(8);
+    let connection = Connection::new(ConnectionId(0), sender, 8, Arc::new(Seven));
+    (RpcService::with_connection(Sub.into_rpc(), usize::MAX, connection), received)
+}
+
+async fn send(service: &RpcService, body: &str) -> MethodResponse {
+    handle_rpc_call(body.as_bytes(), true, BatchRequestConfig::Unlimited, service).await
+}
+
 async fn call(method: &str, params: &str) -> String {
     let request = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{params}}}"#);
     Test.into_rpc().raw_json_request(&request).await
@@ -116,6 +180,39 @@ async fn generic_trait() {
     let module = Generic::<u32, u64>(PhantomData).into_rpc();
     let request = r#"{"jsonrpc":"2.0","id":1,"method":"generic_convert","params":[7]}"#;
     assert_eq!(module.raw_json_request(request).await, result("7"));
+}
+
+#[tokio::test]
+async fn subscription_with_a_notification_name() {
+    let (service, mut received) = connection();
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"sub_subscribe","params":[5]}"#;
+    assert!(send(&service, body).await.is_subscription());
+    assert_eq!(received.recv().await.unwrap(), r#"{"jsonrpc":"2.0","id":1,"result":7}"#);
+    for item in [5, 6] {
+        assert_eq!(
+            received.recv().await.unwrap(),
+            format!(
+                r#"{{"jsonrpc":"2.0","method":"sub_subscription","params":{{"subscription":7,"result":{item}}}}}"#
+            )
+        );
+    }
+}
+
+#[tokio::test]
+async fn subscription_named_like_its_notifications() {
+    let (service, mut received) = connection();
+    send(&service, r#"{"jsonrpc":"2.0","id":1,"method":"sub_peerEvents"}"#).await;
+    received.recv().await.unwrap();
+    assert_eq!(
+        received.recv().await.unwrap(),
+        r#"{"jsonrpc":"2.0","method":"sub_peerEvents","params":{"subscription":7,"result":"added"}}"#
+    );
+    let unsubscribe =
+        r#"{"jsonrpc":"2.0","id":2,"method":"sub_peerEvents_unsubscribe","params":[7]}"#;
+    assert_eq!(
+        send(&service, unsubscribe).await.into_json(),
+        r#"{"jsonrpc":"2.0","id":2,"result":true}"#
+    );
 }
 
 #[test]

@@ -1,0 +1,5 @@
+error: `a_unsubscribe` is registered twice
+ --> tests/ui/subscription_duplicate_unsubscribe.rs:7:14
+  |
+7 |     async fn s(&self) -> alloy_rpc_server::SubscriptionResult;
+  |              ^
