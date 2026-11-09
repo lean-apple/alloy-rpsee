@@ -30,6 +30,7 @@
 //! Anything else gets an HTTP error: `405` for other methods, `415` for other content types,
 //! `413` past the size limit and `400` for a body that isn't JSON.
 
+use super::split_message;
 use crate::{BatchRequestConfig, MethodResponse, RpcServiceT, error::ErrorCode, handle_rpc_call};
 use alloy_json_rpc::{ErrorPayload, Id};
 use bytes::Bytes;
@@ -64,6 +65,48 @@ const JSON_CONTENT_TYPES: [&str; 6] = [
     "application/json-rpc; charset=utf-8",
     "application/json-rpc;charset=utf-8",
 ];
+
+/// Answers one HTTP request through `rpc_service`, reading at most `max_request_size` bytes of
+/// its body.
+pub async fn call_with_service<S: RpcServiceT>(
+    request: HttpRequest,
+    batch_config: BatchRequestConfig,
+    max_request_size: u32,
+    rpc_service: &S,
+) -> HttpResponse {
+    if request.method() != Method::POST {
+        return text(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "Used HTTP Method is not allowed. POST is required\n",
+        );
+    }
+    if !is_json(request.headers().get(header::CONTENT_TYPE)) {
+        return text(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Supplied content type is not allowed. Content-Type: application/json is required\n",
+        );
+    }
+    let limit = usize::try_from(max_request_size).unwrap_or(usize::MAX);
+    let body = request.into_body();
+    // A declared length past the limit is refused before reading anything.
+    if usize::try_from(body.size_hint().lower()).unwrap_or(usize::MAX) > limit {
+        return too_large(max_request_size);
+    }
+    let body = match Limited::new(body, limit).collect().await {
+        Ok(body) => body.to_bytes(),
+        Err(err) if err.is::<LengthLimitError>() => return too_large(max_request_size),
+        Err(err) => {
+            tracing::debug!(%err, "failed to read an HTTP request body");
+            return error(StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::InternalError.into());
+        }
+    };
+    let Some((message, is_single)) = split_message(&body) else {
+        return error(StatusCode::BAD_REQUEST, ErrorCode::ParseError.into());
+    };
+    let response = handle_rpc_call(message, is_single, batch_config, rpc_service).await;
+    // A notification is acknowledged with an empty body.
+    json(StatusCode::OK, response.into_json())
+}
 
 /// The body of the server's HTTP requests and responses, which HTTP middleware may replace.
 #[derive(Debug, Default)]
@@ -100,53 +143,6 @@ impl Body for HttpBody {
     }
 }
 
-/// Answers one HTTP request through `rpc_service`, reading at most `max_request_size` bytes of
-/// its body.
-pub async fn call_with_service<S: RpcServiceT>(
-    request: HttpRequest,
-    batch_config: BatchRequestConfig,
-    max_request_size: u32,
-    rpc_service: &S,
-) -> HttpResponse {
-    if request.method() != Method::POST {
-        return text(
-            StatusCode::METHOD_NOT_ALLOWED,
-            "Used HTTP Method is not allowed. POST is required\n",
-        );
-    }
-    if !is_json(request.headers().get(header::CONTENT_TYPE)) {
-        return text(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "Supplied content type is not allowed. Content-Type: application/json is required\n",
-        );
-    }
-    let limit = usize::try_from(max_request_size).unwrap_or(usize::MAX);
-    let body = request.into_body();
-    // A declared length past the limit is refused before reading anything.
-    if usize::try_from(body.size_hint().lower()).unwrap_or(usize::MAX) > limit {
-        return too_large(max_request_size);
-    }
-    let body = match Limited::new(body, limit).collect().await {
-        Ok(body) => body.to_bytes(),
-        Err(err) if err.is::<LengthLimitError>() => return too_large(max_request_size),
-        Err(err) => {
-            tracing::debug!(%err, "failed to read an HTTP request body");
-            return error(StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::InternalError.into());
-        }
-    };
-    // The first byte past any whitespace tells one message from a batch.
-    let start = body.iter().position(|byte| !byte.is_ascii_whitespace()).unwrap_or(body.len());
-    let is_single = match body.get(start) {
-        Some(b'{') => true,
-        Some(b'[') => false,
-        _ => return error(StatusCode::BAD_REQUEST, ErrorCode::ParseError.into()),
-    };
-    let message = body.slice(start..);
-    let response = handle_rpc_call(&message, is_single, batch_config, rpc_service).await;
-    // A notification is acknowledged with an empty body.
-    json(StatusCode::OK, response.into_json())
-}
-
 // Returns `true` for the content types JSON-RPC clients send.
 fn is_json(content_type: Option<&HeaderValue>) -> bool {
     content_type
@@ -167,6 +163,13 @@ fn error(status: StatusCode, err: ErrorPayload) -> HttpResponse {
 // A JSON body.
 fn json(status: StatusCode, body: String) -> HttpResponse {
     response(status, Full::from(body), JSON)
+}
+
+// A response without a body.
+pub(crate) fn empty(status: StatusCode) -> HttpResponse {
+    let mut response = HttpResponse::new(HttpBody::default());
+    *response.status_mut() = status;
+    response
 }
 
 // A plain-text body.

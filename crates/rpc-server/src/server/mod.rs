@@ -1,4 +1,5 @@
-//! A JSON-RPC server over HTTP, built on hyper and tower.
+//! A JSON-RPC server over HTTP and WebSocket on one port, built on hyper, tower and
+//! tokio-tungstenite.
 //!
 //! [`ServerBuilder`] binds a listener with a [`ServerConfig`] and optional HTTP and RPC
 //! middleware, and [`Server::start`] serves [`Methods`](crate::Methods) until its
@@ -16,3 +17,17 @@ pub use handle::ServerHandle;
 
 pub mod http;
 pub use http::{BoxError, HttpBody, HttpRequest, HttpResponse};
+
+mod ws;
+
+// Splits off the whitespace before a message and tells one message from a batch by its first
+// byte, or returns `None` for a body that isn't JSON.
+pub(crate) fn split_message(body: &[u8]) -> Option<(&[u8], bool)> {
+    let start = body.iter().position(|byte| !byte.is_ascii_whitespace())?;
+    let message = body.get(start..)?;
+    match message.first() {
+        Some(b'{') => Some((message, true)),
+        Some(b'[') => Some((message, false)),
+        _ => None,
+    }
+}
