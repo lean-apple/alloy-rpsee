@@ -42,7 +42,6 @@ use hyper_util::{
     service::TowerToHyperService,
 };
 use std::{
-    convert::Infallible,
     io,
     net::SocketAddr,
     sync::{
@@ -185,7 +184,7 @@ impl<HttpMiddleware, RpcMiddleware> Server<HttpMiddleware, RpcMiddleware> {
 
 impl<HttpMiddleware, RpcMiddleware, S, B> Server<HttpMiddleware, RpcMiddleware>
 where
-    RpcMiddleware: Layer<RpcService> + Send + Sync + 'static,
+    RpcMiddleware: Layer<RpcService> + Clone + Send + 'static,
     RpcMiddleware::Service: RpcServiceT + Send + Sync,
     HttpMiddleware: Layer<HttpService<RpcMiddleware>, Service = S> + Send + 'static,
     S: Service<HttpRequest, Response = HttpResponse<B>> + Clone + Send + 'static,
@@ -216,7 +215,6 @@ where
         let shared = Arc::new(Shared {
             methods,
             config,
-            rpc_middleware,
             connections,
             next_connection_id: AtomicUsize::new(0),
             stop: stop.clone(),
@@ -239,7 +237,10 @@ where
             if let Err(err) = socket.set_nodelay(true) {
                 tracing::debug!(%err, "failed to set TCP_NODELAY");
             }
-            let service = http_middleware.service(HttpService { shared: shared.clone() });
+            let service = http_middleware.service(HttpService {
+                shared: shared.clone(),
+                rpc_middleware: rpc_middleware.clone(),
+            });
             let service =
                 service.map_request(|request: hyper::Request<Incoming>| request.map(HttpBody::new));
             let connection = hyper.serve_connection_with_upgrades(
@@ -260,13 +261,11 @@ where
 
 // What every request of a server shares.
 #[derive(Debug)]
-struct Shared<RpcMiddleware> {
+struct Shared {
     // The methods calls are dispatched to.
     methods: Methods,
     // The limits.
     config: ServerConfig,
-    // Layers wrapping each JSON-RPC call.
-    rpc_middleware: RpcServiceBuilder<RpcMiddleware>,
     // One permit per HTTP request in flight or open WebSocket connection.
     connections: Arc<Semaphore>,
     // The id the next WebSocket connection gets.
@@ -281,25 +280,28 @@ struct Shared<RpcMiddleware> {
 #[derive(Debug)]
 pub struct HttpService<RpcMiddleware> {
     // What every request shares.
-    shared: Arc<Shared<RpcMiddleware>>,
+    shared: Arc<Shared>,
+    // Layers wrapping each JSON-RPC call, kept out of `shared` so they need not be `Sync`.
+    rpc_middleware: RpcServiceBuilder<RpcMiddleware>,
 }
 
-impl<RpcMiddleware> Clone for HttpService<RpcMiddleware> {
+impl<RpcMiddleware: Clone> Clone for HttpService<RpcMiddleware> {
     fn clone(&self) -> Self {
-        Self { shared: self.shared.clone() }
+        Self { shared: self.shared.clone(), rpc_middleware: self.rpc_middleware.clone() }
     }
 }
 
 impl<RpcMiddleware> Service<HttpRequest> for HttpService<RpcMiddleware>
 where
-    RpcMiddleware: Layer<RpcService> + Send + Sync + 'static,
+    RpcMiddleware: Layer<RpcService> + Clone + Send + 'static,
     RpcMiddleware::Service: RpcServiceT + Send + Sync,
 {
     type Response = HttpResponse;
-    type Error = Infallible;
-    type Future = BoxFuture<'static, Result<HttpResponse, Infallible>>;
+    // Never fails, but HTTP middleware that can fail shares the error type.
+    type Error = BoxError;
+    type Future = BoxFuture<'static, Result<HttpResponse, BoxError>>;
 
-    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Infallible>> {
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), BoxError>> {
         Poll::Ready(Ok(()))
     }
 
@@ -326,7 +328,7 @@ where
                 config.max_subscriptions_per_connection,
                 config.id_provider.clone(),
             );
-            let rpc_service = shared.rpc_middleware.service(RpcService::with_connection(
+            let rpc_service = self.rpc_middleware.service(RpcService::with_connection(
                 shared.methods.clone(),
                 max_response_size,
                 connection,
@@ -346,11 +348,10 @@ where
         if !config.enable_http {
             return Box::pin(async { Ok(http::empty(StatusCode::FORBIDDEN)) });
         }
+        let rpc_service =
+            self.rpc_middleware.service(RpcService::new(shared.methods.clone(), max_response_size));
         Box::pin(async move {
             let ServerConfig { max_request_body_size, batch_requests_config, .. } = shared.config;
-            let rpc_service = shared
-                .rpc_middleware
-                .service(RpcService::new(shared.methods.clone(), max_response_size));
             let response = http::call_with_service(
                 request,
                 batch_requests_config,

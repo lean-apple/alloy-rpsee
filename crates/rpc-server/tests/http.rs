@@ -2,22 +2,28 @@
 
 use alloy_rpc_server::{
     ErrorPayload, RpcModule, RpcServiceT,
-    server::{HttpBody, ServerBuilder, ServerConfig, ServerHandle},
+    server::{
+        BoxError, HttpBody, HttpRequest, HttpResponse, ServerBuilder, ServerConfig, ServerHandle,
+    },
 };
+use futures_util::future::BoxFuture;
 use http_body_util::{BodyExt, Full};
 use hyper::{Method, Request, StatusCode, header};
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use std::{
+    cell::Cell,
     future::Future,
+    marker::PhantomData,
     net::SocketAddr,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
+    task::{Context, Poll},
     time::Duration,
 };
 use test_case::test_case;
-use tower::Layer;
+use tower::{Layer, Service};
 
 // A module with `eth_chainId`, a `big` method answering 100 bytes, and a `slow` one.
 fn module() -> RpcModule<()> {
@@ -182,4 +188,93 @@ async fn middleware_wraps_requests_and_calls() {
     let response = client.request(request).await.unwrap();
     assert_eq!(response.headers()["x-test"], "1");
     assert_eq!(calls.load(Ordering::Relaxed), 1);
+}
+
+// An RPC middleware that is `Send` but not `Sync`.
+#[derive(Clone)]
+struct NotSync(PhantomData<Cell<()>>);
+
+impl<S> Layer<S> for NotSync {
+    type Service = S;
+
+    fn layer(&self, inner: S) -> S {
+        inner
+    }
+}
+
+#[tokio::test]
+async fn rpc_middleware_need_not_be_sync() {
+    let server = ServerBuilder::new()
+        .set_rpc_middleware(tower::ServiceBuilder::new().layer(NotSync(PhantomData)))
+        .build("127.0.0.1:0")
+        .await
+        .unwrap();
+    let addr = server.local_addr().unwrap();
+    let _handle = server.start(module());
+    let (status, body) = post(addr, r#"{"jsonrpc":"2.0","id":1,"method":"eth_chainId"}"#).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, r#"{"jsonrpc":"2.0","id":1,"result":"0x1"}"#);
+}
+
+// An HTTP middleware like an auth layer: it answers requests without a token itself, and fails with
+// the inner service's `BoxError`.
+#[derive(Clone)]
+struct RequireToken;
+
+impl<S> Layer<S> for RequireToken {
+    type Service = TokenChecked<S>;
+
+    fn layer(&self, inner: S) -> TokenChecked<S> {
+        TokenChecked(inner)
+    }
+}
+
+#[derive(Clone)]
+struct TokenChecked<S>(S);
+
+impl<S> Service<HttpRequest> for TokenChecked<S>
+where
+    S: Service<HttpRequest, Response = HttpResponse, Error = BoxError>,
+    S::Future: Send + 'static,
+{
+    type Response = HttpResponse;
+    type Error = BoxError;
+    type Future = BoxFuture<'static, Result<HttpResponse, BoxError>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), BoxError>> {
+        self.0.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: HttpRequest) -> Self::Future {
+        if request.headers().contains_key("x-token") {
+            return Box::pin(self.0.call(request));
+        }
+        let mut response = HttpResponse::new(HttpBody::from("missing token"));
+        *response.status_mut() = StatusCode::UNAUTHORIZED;
+        Box::pin(async { Ok(response) })
+    }
+}
+
+#[tokio::test]
+async fn fallible_http_middleware_wraps_the_server() {
+    let server = ServerBuilder::new()
+        .set_http_middleware(tower::ServiceBuilder::new().layer(RequireToken))
+        .build("127.0.0.1:0")
+        .await
+        .unwrap();
+    let addr = server.local_addr().unwrap();
+    let _handle = server.start(module());
+    let call = r#"{"jsonrpc":"2.0","id":1,"method":"eth_chainId"}"#;
+    assert_eq!(post(addr, call).await, (StatusCode::UNAUTHORIZED, "missing token".to_owned()));
+
+    let client = Client::builder(TokioExecutor::new()).build_http::<Full<hyper::body::Bytes>>();
+    let request = Request::post(format!("http://{addr}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("x-token", "1")
+        .body(Full::from(call))
+        .unwrap();
+    let response = client.request(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(body, r#"{"jsonrpc":"2.0","id":1,"result":"0x1"}"#);
 }
