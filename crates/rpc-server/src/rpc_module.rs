@@ -191,7 +191,9 @@ impl<Context: Send + Sync + 'static> RpcModule<Context> {
     ///
     /// # Errors
     ///
-    /// Returns [`RegisterMethodError::AlreadyRegistered`] if `subscribe` or `unsubscribe` is taken.
+    /// Returns [`RegisterMethodError::AlreadyRegistered`] if `subscribe` or `unsubscribe` is taken,
+    /// or [`RegisterMethodError::SubscriptionNameConflict`] if they are the same name. Nothing is
+    /// registered then.
     pub fn register_subscription<P, F, Fut>(
         &mut self,
         subscribe: &'static str,
@@ -204,9 +206,14 @@ impl<Context: Send + Sync + 'static> RpcModule<Context> {
         F: Fn(P, PendingSubscriptionSink, Arc<Context>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = SubscriptionResult> + Send + 'static,
     {
-        // Checked first so a taken `subscribe` doesn't leave `unsubscribe` registered.
-        if self.method(subscribe).is_some() {
-            return Err(RegisterMethodError::AlreadyRegistered(subscribe));
+        if subscribe == unsubscribe {
+            return Err(RegisterMethodError::SubscriptionNameConflict(subscribe));
+        }
+        // Both are checked first, so a taken name leaves neither registered.
+        if let Some(taken) =
+            [subscribe, unsubscribe].into_iter().find(|name| self.method(name).is_some())
+        {
+            return Err(RegisterMethodError::AlreadyRegistered(taken));
         }
         let unsubscribe_method = MethodCallback::new(move |id, params, context| {
             let Some(connection) = context.connection else {
@@ -466,6 +473,25 @@ mod tests {
             module.register_alias("triple", "double"),
             Err(RegisterMethodError::AlreadyRegistered("triple"))
         );
+    }
+
+    #[test]
+    fn subscription_registers_both_names_or_neither() {
+        let mut module = module();
+        let register = |module: &mut RpcModule<_>, subscribe, unsubscribe| {
+            module
+                .register_subscription(subscribe, "n", unsubscribe, |(): (), _, _| async { Ok(()) })
+                .map(drop)
+        };
+        assert_eq!(
+            register(&mut module, "sub", "sub"),
+            Err(RegisterMethodError::SubscriptionNameConflict("sub"))
+        );
+        assert_eq!(
+            register(&mut module, "sub", "double"),
+            Err(RegisterMethodError::AlreadyRegistered("double"))
+        );
+        assert!(module.method("sub").is_none());
     }
 
     #[test]
