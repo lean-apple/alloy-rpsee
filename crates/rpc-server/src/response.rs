@@ -4,7 +4,7 @@
 //! soon as the response passes its size limit, so an oversized result never takes more memory than
 //! the limit.
 
-use crate::{error::OversizedResponse, request::Version, writer::BoundedWriter};
+use crate::{error::ErrorCode, request::Version, writer::BoundedWriter};
 use alloy_json_rpc::{ErrorPayload, Id, Response, ResponsePayload};
 use serde::Serialize;
 use serde_json::value::RawValue;
@@ -18,7 +18,7 @@ const INTERNAL_ERROR_JSON: &str =
 /// # Examples
 ///
 /// ```
-/// use alloy_rpc_server::{ErrorPayload, Id, MethodResponse};
+/// use alloy_rpc_server::{ErrorCode, Id, MethodResponse};
 ///
 /// let response = MethodResponse::success(Id::Number(1), "0x1", usize::MAX);
 /// assert_eq!(response.into_json(), r#"{"jsonrpc":"2.0","id":1,"result":"0x1"}"#);
@@ -26,7 +26,7 @@ const INTERNAL_ERROR_JSON: &str =
 /// let response = MethodResponse::success(Id::Number(1), &"x".repeat(100), 64);
 /// assert!(response.is_error());
 ///
-/// let response = MethodResponse::error(Id::Number(1), ErrorPayload::method_not_found());
+/// let response = MethodResponse::error(Id::Number(1), ErrorCode::MethodNotFound);
 /// assert_eq!(
 ///     response.into_json(),
 ///     r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}"#
@@ -52,15 +52,15 @@ impl MethodResponse {
             Ok(()) => match String::from_utf8(writer.into_bytes()) {
                 Ok(json) => Self { json, kind: Kind::Success },
                 // serde_json only writes UTF-8.
-                Err(_) => Self::error(response.id, ErrorPayload::internal_error()),
+                Err(_) => Self::error(response.id, ErrorCode::InternalError),
             },
             // The writer's only IO error is the size limit.
             Err(err) if err.is_io() => {
-                Self::error(response.id, OversizedResponse { limit: max_response_size })
+                Self::error(response.id, ErrorCode::OversizedResponse.exceeded(max_response_size))
             }
             Err(err) => {
                 tracing::error!(%err, "failed to serialize an RPC result");
-                Self::error(response.id, ErrorPayload::internal_error())
+                Self::error(response.id, ErrorCode::InternalError)
             }
         }
     }

@@ -29,9 +29,9 @@
 use crate::{
     CallContext, Connection, MethodResponse, Methods, Request,
     batch::{Batch, BatchEntry, BatchEntryErr, BatchResponseBuilder},
-    error::BatchError,
+    error::{BatchError, ErrorCode},
 };
-use alloy_json_rpc::{ErrorPayload, Id};
+use alloy_json_rpc::Id;
 use futures_util::{FutureExt, future::Either};
 use serde::Deserialize;
 use serde_json::value::RawValue;
@@ -101,9 +101,7 @@ impl RpcServiceT for RpcService {
                 };
                 Either::Left(method.call(id, request.params, &context))
             }
-            None => {
-                Either::Right(ready(MethodResponse::error(id, ErrorPayload::method_not_found())))
-            }
+            None => Either::Right(ready(MethodResponse::error(id, ErrorCode::MethodNotFound))),
         }
     }
 
@@ -198,7 +196,7 @@ pub async fn handle_rpc_call<S: RpcServiceT>(
     if is_single {
         // A body that isn't UTF-8 isn't JSON either.
         let Ok(message) = std::str::from_utf8(body) else {
-            return MethodResponse::error(Id::None, ErrorPayload::parse_error());
+            return MethodResponse::error(Id::None, ErrorCode::ParseError);
         };
         return match parse_entry(message) {
             Ok(BatchEntry::Call(request)) => call_guarded(rpc_service, request).await,
@@ -243,9 +241,9 @@ fn parse_entry(message: &str) -> Result<BatchEntry<'_>, BatchEntryErr> {
 // the message carries, if any.
 fn invalid_entry(message: &str) -> BatchEntryErr {
     let Ok(message) = serde_json::from_str::<&RawValue>(message) else {
-        return BatchEntryErr::new(Id::None, ErrorPayload::parse_error());
+        return BatchEntryErr::new(Id::None, ErrorCode::ParseError.into());
     };
-    BatchEntryErr::new(recover_id(message), ErrorPayload::invalid_request())
+    BatchEntryErr::new(recover_id(message), ErrorCode::InvalidRequest.into())
 }
 
 // The `id` of an object that isn't a valid request, so the client can still match the error, or
@@ -277,13 +275,14 @@ async fn call_guarded<S: RpcServiceT>(service: &S, request: Request<'_>) -> Meth
         Ok(call) => AssertUnwindSafe(call).catch_unwind().await,
         Err(panic) => Err(panic),
     };
-    response.unwrap_or_else(|_| MethodResponse::error(id, ErrorPayload::internal_error()))
+    response.unwrap_or_else(|_| MethodResponse::error(id, ErrorCode::InternalError))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::RpcModule;
+    use alloy_json_rpc::ErrorPayload;
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -327,9 +326,9 @@ mod tests {
     #[test_case(r#"{"jsonrpc":"2.0","id":1,"method":"boomAsync"}"#, r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"Internal error"}}"# ; "async panic")]
     #[test_case(r#"{"jsonrpc":"2.0","method":"count"}"#, "" ; "notification")]
     #[test_case(r#"{"jsonrpc":"2.0","id":1"#, r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}"# ; "not json")]
-    #[test_case(r#"{"jsonrpc":"1.0","id":"a","method":"count"}"#, r#"{"jsonrpc":"2.0","id":"a","error":{"code":-32600,"message":"Invalid Request"}}"# ; "invalid request keeps its id")]
-    #[test_case(r#"{"jsonrpc":"1.0","id":{},"method":"count"}"#, r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid Request"}}"# ; "invalid id is null")]
-    #[test_case(r#"[1]"#, r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid Request"}}"# ; "array as single")]
+    #[test_case(r#"{"jsonrpc":"1.0","id":"a","method":"count"}"#, r#"{"jsonrpc":"2.0","id":"a","error":{"code":-32600,"message":"Invalid request"}}"# ; "invalid request keeps its id")]
+    #[test_case(r#"{"jsonrpc":"1.0","id":{},"method":"count"}"#, r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid request"}}"# ; "invalid id is null")]
+    #[test_case(r#"[1]"#, r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid request"}}"# ; "array as single")]
     #[tokio::test]
     async fn single(body: &str, response: &str) {
         let (service, _) = service(usize::MAX);
@@ -375,18 +374,18 @@ mod tests {
             concat!(
                 r#"[{"jsonrpc":"2.0","id":1,"result":0},"#,
                 r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"Method not found"}},"#,
-                r#"{"jsonrpc":"2.0","id":3,"error":{"code":-32600,"message":"Invalid Request"}},"#,
+                r#"{"jsonrpc":"2.0","id":3,"error":{"code":-32600,"message":"Invalid request"}},"#,
                 r#"{"jsonrpc":"2.0","id":4,"error":{"code":-32603,"message":"Internal error"}},"#,
                 r#"{"jsonrpc":"2.0","id":5,"result":1}]"#,
             )
         );
     }
 
-    #[test_case("[]", BatchRequestConfig::Unlimited, r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid Request"}}"# ; "empty")]
+    #[test_case("[]", BatchRequestConfig::Unlimited, r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid request"}}"# ; "empty")]
     #[test_case("[1", BatchRequestConfig::Unlimited, r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}"# ; "not json")]
     #[test_case("[1]", BatchRequestConfig::Disabled, r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32005,"message":"Batched requests are not supported by this server"}}"# ; "disabled")]
     #[test_case("[1,2]", BatchRequestConfig::Limit(1), r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32010,"message":"The batch request was too large","data":"Exceeded max limit of 1"}}"# ; "too many entries")]
-    #[test_case("[1]", BatchRequestConfig::Limit(1), r#"[{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid Request"}}]"# ; "at the limit")]
+    #[test_case("[1]", BatchRequestConfig::Limit(1), r#"[{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid request"}}]"# ; "at the limit")]
     #[tokio::test]
     async fn batch_errors(body: &str, batch_config: BatchRequestConfig, response: &str) {
         assert_eq!(answer(body, batch_config).await, response);

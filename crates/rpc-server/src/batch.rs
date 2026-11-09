@@ -26,7 +26,7 @@
 
 //! Batch requests and their joined response.
 
-use crate::{MethodResponse, Request, error::OversizedBatchResponse};
+use crate::{MethodResponse, Request, error::ErrorCode};
 use alloy_json_rpc::{ErrorPayload, Id};
 
 // Initial capacity of a batch response.
@@ -138,7 +138,10 @@ impl BatchResponseBuilder {
         if self.json.len().saturating_add(response.len()).saturating_add(1) > self.max_response_size
         {
             let limit = self.max_response_size;
-            return Err(MethodResponse::error(Id::None, OversizedBatchResponse { limit }));
+            return Err(MethodResponse::error(
+                Id::None,
+                ErrorCode::TooBigBatchResponse.exceeded(limit),
+            ));
         }
         self.json.push_str(&response);
         self.json.push(',');
@@ -153,7 +156,7 @@ impl BatchResponseBuilder {
     // The joined array, or `-32600 Invalid request` for an empty batch.
     pub(crate) fn finish(mut self) -> MethodResponse {
         if self.is_empty() {
-            return MethodResponse::error(Id::None, ErrorPayload::invalid_request());
+            return MethodResponse::error(Id::None, ErrorCode::InvalidRequest);
         }
         self.json.pop();
         self.json.push(']');
