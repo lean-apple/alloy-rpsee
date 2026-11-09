@@ -233,8 +233,10 @@ async fn answer<S: RpcServiceT>(
     (!response.is_notification() && !response.is_subscription()).then(|| response.into_json())
 }
 
-// Returns `true` if `headers` ask to switch to WebSocket. The handshake checks the rest.
-pub(crate) fn is_upgrade_request(headers: &HeaderMap) -> bool {
+/// Returns `true` if `headers` ask to switch to WebSocket.
+///
+/// Only the `Upgrade` header is checked. The handshake validates the rest.
+pub fn is_upgrade_request(headers: &HeaderMap) -> bool {
     headers.get(header::UPGRADE).and_then(|value| value.to_str().ok()).is_some_and(|value| {
         value.split(',').any(|token| token.trim().eq_ignore_ascii_case("websocket"))
     })

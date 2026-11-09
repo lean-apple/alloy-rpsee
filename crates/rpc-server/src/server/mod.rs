@@ -19,6 +19,7 @@ pub mod http;
 pub use http::{BoxError, HttpBody, HttpRequest, HttpResponse};
 
 mod ws;
+pub use ws::is_upgrade_request;
 
 // Splits off the whitespace before a message and tells one message from a batch by its first
 // byte, or returns `None` for a body that isn't JSON.
