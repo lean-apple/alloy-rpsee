@@ -107,6 +107,12 @@ impl BatchEntryErr {
     }
 }
 
+impl From<BatchEntryErr> for MethodResponse {
+    fn from(err: BatchEntryErr) -> Self {
+        Self::error(err.id, err.error)
+    }
+}
+
 // Joins a batch's responses into one array, at most `max_response_size` bytes long.
 #[derive(Debug)]
 pub(crate) struct BatchResponseBuilder {

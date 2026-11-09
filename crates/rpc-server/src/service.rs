@@ -96,19 +96,13 @@ impl RpcServiceT for RpcService {
             // Entries run one after another, so a batch takes one call at a time.
             for entry in batch {
                 let response = match entry {
-                    Ok(BatchEntry::Call(request)) => {
-                        let id = request.id.clone().unwrap_or(Id::None);
-                        catch_call_panic(id, || service.call(request)).await
-                    }
+                    Ok(BatchEntry::Call(request)) => call_guarded(&service, request).await,
                     Ok(BatchEntry::Notification(request)) => {
                         got_notification = true;
                         service.notification(request).await;
                         continue;
                     }
-                    Err(err) => {
-                        let (error, id) = err.into_parts();
-                        MethodResponse::error(id, error)
-                    }
+                    Err(err) => err.into(),
                 };
                 if let Err(too_big) = responses.append(response) {
                     return too_big;
@@ -175,13 +169,14 @@ pub async fn handle_rpc_call<S: RpcServiceT>(
     rpc_service: &S,
 ) -> MethodResponse {
     if is_single {
-        return match serde_json::from_slice::<Request<'_>>(body) {
-            Ok(request) if request.id.is_none() => rpc_service.notification(request).await,
-            Ok(request) => {
-                let id = request.id.clone().unwrap_or(Id::None);
-                catch_call_panic(id, || rpc_service.call(request)).await
-            }
-            Err(_) => invalid_message(body),
+        // A body that isn't UTF-8 isn't JSON either.
+        let Ok(message) = std::str::from_utf8(body) else {
+            return MethodResponse::error(Id::None, ErrorPayload::parse_error());
+        };
+        return match parse_entry(message) {
+            Ok(BatchEntry::Call(request)) => call_guarded(rpc_service, request).await,
+            Ok(BatchEntry::Notification(request)) => rpc_service.notification(request).await,
+            Err(err) => err.into(),
         };
     }
     match parse_batch(body, batch_config) {
@@ -204,23 +199,26 @@ fn parse_batch(body: &[u8], batch_config: BatchRequestConfig) -> Result<Batch<'_
     if entries.len() > max_entries {
         return Err(BatchError::TooBig { limit: max_entries });
     }
-    Ok(entries
-        .into_iter()
-        .map(|entry| match serde_json::from_str::<Request<'_>>(entry.get()) {
-            Ok(request) if request.id.is_none() => Ok(BatchEntry::Notification(request)),
-            Ok(request) => Ok(BatchEntry::Call(request)),
-            Err(_) => Err(BatchEntryErr::new(recover_id(entry), ErrorPayload::invalid_request())),
-        })
-        .collect())
+    Ok(entries.into_iter().map(|entry| parse_entry(entry.get())).collect())
 }
 
-// `-32700 Parse error` for a body that isn't JSON, otherwise `-32600 Invalid request` to the id the
-// body carries, if any.
-fn invalid_message(body: &[u8]) -> MethodResponse {
-    let Ok(message) = serde_json::from_slice::<&RawValue>(body) else {
-        return MethodResponse::error(Id::None, ErrorPayload::parse_error());
+// Sorts one message, alone or in a batch, into a call, a notification, or the error it is
+// answered with.
+fn parse_entry(message: &str) -> Result<BatchEntry<'_>, BatchEntryErr> {
+    match serde_json::from_str::<Request<'_>>(message) {
+        Ok(request) if request.id.is_none() => Ok(BatchEntry::Notification(request)),
+        Ok(request) => Ok(BatchEntry::Call(request)),
+        Err(_) => Err(invalid_entry(message)),
+    }
+}
+
+// `-32700 Parse error` for a message that isn't JSON, otherwise `-32600 Invalid request` to the id
+// the message carries, if any.
+fn invalid_entry(message: &str) -> BatchEntryErr {
+    let Ok(message) = serde_json::from_str::<&RawValue>(message) else {
+        return BatchEntryErr::new(Id::None, ErrorPayload::parse_error());
     };
-    MethodResponse::error(recover_id(message), ErrorPayload::invalid_request())
+    BatchEntryErr::new(recover_id(message), ErrorPayload::invalid_request())
 }
 
 // The `id` of an object that isn't a valid request, so the client can still match the error, or
@@ -244,13 +242,11 @@ struct WithId {
     id: Option<Id>,
 }
 
-// Answers a call that panics with `-32603 Internal error`, so the client still gets a response.
-// A synchronous method runs when the call starts, so starting it is guarded too.
-async fn catch_call_panic<F: Future<Output = MethodResponse>>(
-    id: Id,
-    call: impl FnOnce() -> F,
-) -> MethodResponse {
-    let response = match catch_unwind(AssertUnwindSafe(call)) {
+// Calls `request` on `service`, answering a panic with `-32603 Internal error` so the client still
+// gets a response. A synchronous method runs when the call starts, so starting it is guarded too.
+async fn call_guarded<S: RpcServiceT>(service: &S, request: Request<'_>) -> MethodResponse {
+    let id = request.id.clone().unwrap_or(Id::None);
+    let response = match catch_unwind(AssertUnwindSafe(|| service.call(request))) {
         Ok(call) => AssertUnwindSafe(call).catch_unwind().await,
         Err(panic) => Err(panic),
     };
@@ -313,6 +309,16 @@ mod tests {
         let answer =
             handle_rpc_call(body.as_bytes(), true, BatchRequestConfig::Unlimited, &service);
         assert_eq!(answer.await.into_json(), response);
+    }
+
+    #[tokio::test]
+    async fn non_utf8_body_is_a_parse_error() {
+        let (service, _) = service(usize::MAX);
+        let response = handle_rpc_call(b"\xff", true, BatchRequestConfig::Unlimited, &service);
+        assert_eq!(
+            response.await.into_json(),
+            r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}"#
+        );
     }
 
     #[tokio::test]
