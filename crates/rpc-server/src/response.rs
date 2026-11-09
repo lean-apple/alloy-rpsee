@@ -68,7 +68,7 @@ impl MethodResponse {
     /// Serializes an error response to `id`.
     pub fn error(id: Id, err: impl Into<ErrorPayload>) -> Self {
         let err = err.into();
-        // Alloy's `ErrorPayload` writes `"data": null`, which Reth's clients don't receive today.
+        // Alloy's `ErrorPayload` writes `"data": null`, which reth's clients don't receive today.
         let response = ErrorResponse {
             jsonrpc: Version::V2,
             id: &id,
