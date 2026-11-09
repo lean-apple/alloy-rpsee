@@ -294,3 +294,26 @@ async fn silent_connection_is_closed() {
     }
     panic!("the connection stayed open");
 }
+
+#[tokio::test(start_paused = true)]
+async fn stalled_body_is_answered_with_a_timeout() {
+    let (addr, _handle) = start(ServerConfig::default()).await;
+    let socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let head = "POST / HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 64\r\n\r\n{";
+    socket.writable().await.unwrap();
+    socket.try_write(head.as_bytes()).unwrap();
+    let mut response = [0; 12];
+    // Each second passes instantly on the paused clock, until the server gives up on the body.
+    for _ in 0..60 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        match socket.try_read(&mut response) {
+            Ok(read) => {
+                assert_eq!(&response[..read], b"HTTP/1.1 408");
+                return;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(err) => panic!("expected a response, got {err}"),
+        }
+    }
+    panic!("the server kept waiting for the body");
+}
