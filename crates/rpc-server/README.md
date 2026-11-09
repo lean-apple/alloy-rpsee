@@ -1,6 +1,6 @@
 # alloy-rpc-server
 
-A JSON-RPC 2.0 server built on Alloy's JSON-RPC types. Register methods on an `RpcModule`, then
+A JSON-RPC 2.0 server built on alloy's JSON-RPC types. Register methods on an `RpcModule`, then
 serve them over HTTP and WebSocket with `ServerBuilder`, or answer requests directly with
 `handle_rpc_call`.
 
