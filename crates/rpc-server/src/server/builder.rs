@@ -196,10 +196,10 @@ where
 {
     /// Serves `methods` until the returned handle stops the server.
     pub fn start(self, methods: impl Into<Methods>) -> ServerHandle {
-        let (stop, tasks) = (CancellationToken::new(), TaskTracker::new());
-        let handle = ServerHandle::new(stop.clone(), tasks.clone());
+        let handle = ServerHandle::new();
+        let tasks = handle.tasks().clone();
         let runtime = self.builder.config.tokio_runtime.clone();
-        let serve = self.serve(methods.into(), stop, tasks.clone());
+        let serve = self.serve(methods.into(), handle.stop_token(), tasks.clone());
         match runtime {
             Some(runtime) => drop(tasks.spawn_on(serve, &runtime)),
             None => drop(tasks.spawn(serve)),

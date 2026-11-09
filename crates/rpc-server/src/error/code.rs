@@ -79,8 +79,8 @@ impl ErrorCode {
         }
     }
 
-    // The error for a request past `limit`, which names the limit in its `data`.
-    pub(crate) fn exceeded(self, limit: impl fmt::Display) -> ErrorPayload {
+    /// Returns the error for a request past `limit`, naming the limit in its `data`.
+    pub fn exceeded(self, limit: impl fmt::Display) -> ErrorPayload {
         ErrorPayload { data: error_data(&format!("Exceeded max limit of {limit}")), ..self.into() }
     }
 }
