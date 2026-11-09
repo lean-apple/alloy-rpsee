@@ -61,8 +61,8 @@ name = "alloy-rpc-server"
 version = "0.1.0"
 dependencies = [
  "alloy-json-rpc",
+ "alloy-primitives",
  "futures-util",
- "rustc-hash",
  "serde",
  "serde_json",
  "test-case",

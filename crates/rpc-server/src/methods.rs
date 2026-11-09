@@ -28,11 +28,11 @@
 
 use crate::{MethodResponse, Request, error::RegisterMethodError};
 use alloy_json_rpc::{ErrorPayload, Id};
+use alloy_primitives::map::{Entry, HashMap};
 use futures_util::future::{BoxFuture, Either};
-use rustc_hash::FxHashMap;
 use serde::de::IgnoredAny;
 use serde_json::value::RawValue;
-use std::{collections::hash_map::Entry, fmt, future::Ready, sync::Arc};
+use std::{fmt, future::Ready, sync::Arc};
 
 /// The future of a method call. A synchronous method's response is ready without an allocation.
 pub type ResponseFuture = Either<Ready<MethodResponse>, BoxFuture<'static, MethodResponse>>;
@@ -45,9 +45,8 @@ type Callback = dyn Fn(Id, Option<&RawValue>, usize) -> ResponseFuture + Send + 
 /// Cloning shares the table, and changing a shared table copies it first.
 #[derive(Debug, Clone, Default)]
 pub struct Methods {
-    // The registered methods. The names are the server's own, so callers can't pick colliding
-    // keys and a fast hash is safe.
-    callbacks: Arc<FxHashMap<&'static str, MethodCallback>>,
+    // The registered methods.
+    callbacks: Arc<HashMap<&'static str, MethodCallback>>,
 }
 
 impl Methods {
