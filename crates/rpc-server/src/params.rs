@@ -1,21 +1,22 @@
 //! Method parameter decoding.
 //!
 //! Params are positional, as in geth. Trailing optional params may be left out and extra ones are
-//! ignored. A method without params takes `()`. For `struct Params(String, #[serde(default)]
-//! Option<u64>)`:
+//! ignored. A method without params takes `()`. Errors are worded as geth words them. For
+//! `struct Params(String, #[serde(default)] Option<u64>)`:
 //!
 //! ```text
 //! ["0xab", 5]       -> Params("0xab", Some(5))
 //! ["0xab"]          -> Params("0xab", None)
 //! ["0xab", 5, true] -> Params("0xab", Some(5))
-//! []                -> -32602 Invalid params
-//! {"block": "0xab"} -> -32602 Invalid params
+//! [5]               -> -32602 invalid argument 0: invalid type: integer `5`, expected a string
+//! []                -> -32602 missing value for required argument 0
+//! {"block": "0xab"} -> -32602 non-array args
 //! ```
 
 use crate::InvalidParams;
 use serde::{
     Deserializer,
-    de::{DeserializeOwned, IgnoredAny, SeqAccess, Visitor},
+    de::{DeserializeOwned, DeserializeSeed, Error as _, IgnoredAny, SeqAccess, Visitor},
     forward_to_deserialize_any,
 };
 use serde_json::value::RawValue;
@@ -44,11 +45,13 @@ use std::fmt;
 /// # Ok::<_, serde_json::Error>(())
 /// ```
 pub fn parse_params<T: DeserializeOwned>(params: Option<&RawValue>) -> Result<T, InvalidParams> {
+    let params = params.map_or("[]", RawValue::get);
+    if params.starts_with('{') {
+        return Err(InvalidParams::NonArray);
+    }
     // A `RawValue` holds exactly one JSON value, so nothing can trail it.
-    T::deserialize(IgnoreExtraParams(&mut serde_json::Deserializer::from_str(
-        params.map_or("[]", RawValue::get),
-    )))
-    .map_err(InvalidParams::from)
+    T::deserialize(IgnoreExtraParams(&mut serde_json::Deserializer::from_str(params)))
+        .map_err(InvalidParams::from)
 }
 
 // Lets a tuple or tuple struct decode an array longer than its fields, which serde rejects.
@@ -95,10 +98,53 @@ impl<'de, V: Visitor<'de>> Visitor<'de> for IgnoreExtraParams<V> {
         self.0.expecting(f)
     }
 
-    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<V::Value, A::Error> {
-        let value = self.0.visit_seq(&mut seq)?;
-        while seq.next_element::<IgnoredAny>()?.is_some() {}
+    fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<V::Value, A::Error> {
+        let mut seq = Arguments { seq, index: 0, ended: false };
+        let value = match self.0.visit_seq(&mut seq) {
+            Ok(value) => value,
+            // The array ran out before the arguments did.
+            Err(_) if seq.ended => {
+                let index = seq.index;
+                return Err(A::Error::custom(format_args!(
+                    "missing value for required argument {index}"
+                )));
+            }
+            Err(err) => return Err(err),
+        };
+        while seq.seq.next_element::<IgnoredAny>()?.is_some() {}
         Ok(value)
+    }
+}
+
+// The params array, counting the arguments read so errors can name the argument.
+struct Arguments<A> {
+    // The array.
+    seq: A,
+    // The index of the next argument.
+    index: usize,
+    // Whether the array ran out.
+    ended: bool,
+}
+
+impl<'de, A: SeqAccess<'de>> SeqAccess<'de> for Arguments<A> {
+    type Error = A::Error;
+
+    fn next_element_seed<T: DeserializeSeed<'de>>(
+        &mut self,
+        seed: T,
+    ) -> Result<Option<T::Value>, A::Error> {
+        let index = self.index;
+        match self.seq.next_element_seed(seed) {
+            Ok(Some(value)) => {
+                self.index = index.saturating_add(1);
+                Ok(Some(value))
+            }
+            Ok(None) => {
+                self.ended = true;
+                Ok(None)
+            }
+            Err(err) => Err(A::Error::custom(format_args!("invalid argument {index}: {err}"))),
+        }
     }
 }
 
@@ -159,10 +205,7 @@ mod tests {
     #[test]
     fn unit_rejects_an_object() {
         let err = ErrorPayload::from(parse::<()>(Some(r#"{"a":1}"#)).unwrap_err());
-        assert_eq!(
-            err.data.unwrap().get(),
-            r#""invalid type: map, expected unit at line 1 column 0""#
-        );
+        assert_eq!(err.message, "non-array args");
     }
 
     #[test_case(None ; "absent")]
@@ -171,12 +214,19 @@ mod tests {
         assert_eq!(parse::<OptionalOnly>(raw).unwrap(), OptionalOnly(None));
     }
 
-    #[test_case(None, "invalid length 0, expected tuple struct Params with 2 elements at line 1 column 2" ; "absent")]
-    #[test_case(Some(r#"[5]"#), "invalid type: integer `5`, expected a string at line 1 column 2" ; "wrong type")]
-    #[test_case(Some(r#"{"a":1}"#), "invalid type: map, expected tuple struct Params at line 1 column 0" ; "object")]
-    fn rejects(raw: Option<&str>, data: &str) {
+    #[test_case(None, "missing value for required argument 0" ; "absent")]
+    #[test_case(Some(r#"[5]"#), "invalid argument 0: invalid type: integer `5`, expected a string" ; "wrong type")]
+    #[test_case(Some(r#"["0xab", "x"]"#), "invalid argument 1: invalid type: string \"x\", expected u64" ; "second argument")]
+    #[test_case(Some(r#"{"a":1}"#), "non-array args" ; "object")]
+    fn rejects(raw: Option<&str>, message: &str) {
         let err = ErrorPayload::from(parse::<Params>(raw).unwrap_err());
-        assert_eq!((err.code, err.message.as_ref()), (-32602, "Invalid params"));
-        assert_eq!(err.data.unwrap().get(), serde_json::to_string(data).unwrap());
+        assert_eq!((err.code, err.message.as_ref()), (-32602, message));
+        assert!(err.data.is_none());
+    }
+
+    #[test]
+    fn missing_argument_after_others_is_named() {
+        let err = ErrorPayload::from(parse::<(String, u64)>(Some(r#"["a"]"#)).unwrap_err());
+        assert_eq!(err.message, "missing value for required argument 1");
     }
 }

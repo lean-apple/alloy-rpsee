@@ -24,8 +24,8 @@ use tokio_util::sync::CancellationToken;
 /// Methods that share a context, such as one RPC namespace.
 ///
 /// A method takes its params as a type that decodes from positional params, see
-/// [`parse_params`]. Params that don't decode are answered with `-32602 Invalid params` without
-/// running the method. The module derefs to its [`Methods`].
+/// [`parse_params`]. Params that don't decode are answered with `-32602`, naming the argument,
+/// without running the method. The module derefs to its [`Methods`].
 ///
 /// # Examples
 ///
@@ -332,7 +332,7 @@ mod tests {
     use serde_json::value::RawValue;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    const INVALID_PARAMS: &str = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"Invalid params","data":"invalid type: string \"x\", expected u64 at line 1 column 4"}}"#;
+    const INVALID_PARAMS: &str = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"invalid argument 0: invalid type: string \"x\", expected u64"}}"#;
 
     fn module() -> RpcModule<AtomicUsize> {
         let mut module = RpcModule::new(AtomicUsize::new(0));

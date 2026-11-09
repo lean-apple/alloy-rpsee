@@ -156,7 +156,7 @@ async fn trailing_options_may_be_left_out() {
 async fn required_param_is_required() {
     assert_eq!(
         call("test_add", "[]").await,
-        r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"Invalid params","data":"invalid length 0, expected tuple struct __TestApiAddParams with 3 elements at line 1 column 2"}}"#
+        r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"missing value for required argument 0"}}"#
     );
 }
 
