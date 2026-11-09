@@ -211,6 +211,18 @@ async fn calls_past_the_limit_are_busy_and_a_full_connection_still_closes() {
         call(&mut ws, r#"{"jsonrpc":"2.0","id":null,"method":"eth_chainId"}"#).await,
         r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32009,"message":"Server is busy, try again later"}}"#
     );
+    // A batch gets one error per call, without its notifications.
+    let batch = r#"[{"jsonrpc":"2.0","id":3,"method":"eth_chainId"},{"jsonrpc":"2.0","method":"eth_chainId"},{"jsonrpc":"2.0","id":4,"method":"eth_chainId"}]"#;
+    assert_eq!(
+        call(&mut ws, batch).await,
+        r#"[{"jsonrpc":"2.0","id":3,"error":{"code":-32009,"message":"Server is busy, try again later"}},{"jsonrpc":"2.0","id":4,"error":{"code":-32009,"message":"Server is busy, try again later"}}]"#
+    );
+    // A batch of notifications gets no answer, so the next message answers the call after it.
+    ws.send(Message::text(r#"[{"jsonrpc":"2.0","method":"eth_chainId"}]"#)).await.unwrap();
+    assert_eq!(
+        call(&mut ws, r#"{"jsonrpc":"2.0","id":5,"method":"eth_chainId"}"#).await,
+        r#"{"jsonrpc":"2.0","id":5,"error":{"code":-32009,"message":"Server is busy, try again later"}}"#
+    );
     ws.close(None).await.unwrap();
     let dropped = tokio::time::timeout(Duration::from_secs(5), ended.recv()).await;
     assert!(dropped.expect("the call kept running").is_some());

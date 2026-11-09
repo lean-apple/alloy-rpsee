@@ -46,6 +46,7 @@ use bytes::Bytes;
 use futures_util::{Sink, SinkExt, Stream, StreamExt, future};
 use hyper::{HeaderMap, StatusCode, header, upgrade::Upgraded};
 use hyper_util::rt::TokioIo;
+use serde_json::value::RawValue;
 use std::{sync::Arc, time::Duration};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_tungstenite::{
@@ -237,13 +238,26 @@ async fn write_loop<Si>(
     }
 }
 
-// The `-32009 Server is busy` answer to `body`, under its id if it's a single call, or `None` for
-// a notification, which gets no answer.
+// The `-32009 Server is busy` answer to `body`, with one error per call of a batch under its id,
+// or `None` if it holds only notifications, which get no answer.
 fn busy(body: &[u8]) -> Option<String> {
-    match split_message(body) {
-        Some((message, true)) => busy_call(message).map(MethodResponse::into_json),
-        _ => Some(MethodResponse::error(Id::None, ErrorCode::ServerIsBusy).into_json()),
+    let unreadable = || Some(MethodResponse::error(Id::None, ErrorCode::ServerIsBusy).into_json());
+    let Some((message, is_single)) = split_message(body) else { return unreadable() };
+    if is_single {
+        return busy_call(message).map(MethodResponse::into_json);
     }
+    let Ok(entries) = serde_json::from_slice::<Vec<&RawValue>>(message) else {
+        return unreadable();
+    };
+    if entries.is_empty() {
+        return unreadable();
+    }
+    let answers = entries
+        .iter()
+        .filter_map(|entry| busy_call(entry.get().as_bytes()))
+        .map(MethodResponse::into_json)
+        .collect::<Vec<_>>();
+    (!answers.is_empty()).then(|| format!("[{}]", answers.join(",")))
 }
 
 // The busy error for one request, or `None` for a notification. A request that fails to parse is
