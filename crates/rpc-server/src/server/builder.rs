@@ -246,17 +246,10 @@ where
                 rpc_middleware: rpc_middleware.clone(),
             });
             let request_received = Arc::new(Notify::new());
-            let service = service.map_request({
-                let request_received = request_received.clone();
-                move |request: hyper::Request<Incoming>| {
-                    request_received.notify_one();
-                    request.map(HttpBody::new)
-                }
-            });
-            let connection = hyper.serve_connection_with_upgrades(
-                TokioIo::new(socket),
-                TowerToHyperService::new(service),
-            );
+            let service =
+                service.map_request(|request: hyper::Request<Incoming>| request.map(HttpBody::new));
+            let service = notify_on_request(service, request_received.clone());
+            let connection = hyper.serve_connection_with_upgrades(TokioIo::new(socket), service);
             let connection = graceful.watch(connection.into_owned());
             tasks.spawn(async move {
                 // hyper's header timeout starts only once it has read enough to choose between
@@ -384,5 +377,66 @@ where
             drop(permit);
             Ok(response)
         })
+    }
+}
+
+// Signals arrival before Tower readiness can delay a received request.
+fn notify_on_request<S, R, B>(
+    service: S,
+    request_received: Arc<Notify>,
+) -> impl hyper::service::Service<
+    hyper::Request<R>,
+    Response = HttpResponse<B>,
+    Error = S::Error,
+    Future: Send,
+>
+where
+    S: Service<hyper::Request<R>, Response = HttpResponse<B>> + Clone + Send,
+    S::Error: Into<BoxError>,
+    S::Future: Send,
+    R: Body + Send,
+    B: Body,
+{
+    let service = TowerToHyperService::new(service);
+    hyper::service::service_fn(move |request| {
+        request_received.notify_one();
+        hyper::service::Service::call(&service, request)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::FutureExt;
+    use std::convert::Infallible;
+
+    // Models middleware whose capacity is exhausted.
+    #[derive(Clone)]
+    struct NotReady;
+
+    impl Service<HttpRequest> for NotReady {
+        type Response = HttpResponse;
+        type Error = Infallible;
+        type Future = future::Ready<Result<HttpResponse, Infallible>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Infallible>> {
+            Poll::Pending
+        }
+
+        fn call(&mut self, _request: HttpRequest) -> Self::Future {
+            future::ready(Ok(http::empty(StatusCode::OK)))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn request_arrival_precedes_middleware_readiness() {
+        let request_received = Arc::new(Notify::new());
+        let service = notify_on_request(NotReady, request_received.clone());
+        let mut response =
+            pin!(hyper::service::Service::call(&service, hyper::Request::new(HttpBody::from(""))));
+        assert!(response.as_mut().now_or_never().is_none());
+        assert!(
+            tokio::time::timeout(FIRST_REQUEST_TIMEOUT, request_received.notified()).await.is_ok()
+        );
     }
 }
