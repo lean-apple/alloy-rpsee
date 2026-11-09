@@ -127,7 +127,7 @@ impl<Context: Send + Sync + 'static> RpcModule<Context> {
     /// Registers a method that may block, run on tokio's blocking thread pool along with the
     /// serialization of its result.
     ///
-    /// A method that panics is answered with `-32603 Internal error`. It must be called within a
+    /// A method that panics is answered with `-32603 Internal error`. Its calls must run within a
     /// tokio runtime.
     ///
     /// # Errors
@@ -157,7 +157,12 @@ impl<Context: Send + Sync + 'static> RpcModule<Context> {
             });
             Either::Right(Box::pin(async move {
                 call.await.unwrap_or_else(|err| {
-                    tracing::error!(%err, method = method_name, "blocking RPC method failed");
+                    // The task also fails when the runtime shuts down, which isn't a fault.
+                    if err.is_panic() {
+                        tracing::error!(%err, method = method_name, "blocking RPC method panicked");
+                    } else {
+                        tracing::debug!(%err, method = method_name, "blocking RPC method cancelled");
+                    }
                     MethodResponse::error(error_id, ErrorPayload::internal_error())
                 })
             }))
