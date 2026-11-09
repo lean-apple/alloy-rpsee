@@ -30,7 +30,7 @@ use crate::BatchRequestConfig;
 use tokio::runtime::Handle;
 
 /// The default request and response size limit, 10 MiB.
-pub const TEN_MB_SIZE_BYTES: u32 = 10 * 1024 * 1024;
+pub const DEFAULT_SIZE_LIMIT: u32 = 10 * 1024 * 1024;
 
 /// The server's limits and runtime.
 #[derive(Debug, Clone)]
@@ -57,8 +57,8 @@ impl ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            max_request_body_size: TEN_MB_SIZE_BYTES,
-            max_response_body_size: TEN_MB_SIZE_BYTES,
+            max_request_body_size: DEFAULT_SIZE_LIMIT,
+            max_response_body_size: DEFAULT_SIZE_LIMIT,
             max_connections: 100,
             batch_requests_config: BatchRequestConfig::Unlimited,
             tokio_runtime: None,

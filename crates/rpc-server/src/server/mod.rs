@@ -9,7 +9,7 @@ mod builder;
 pub use builder::{HttpService, RpcServiceBuilder, Server, ServerBuilder};
 
 mod config;
-pub use config::{ServerConfig, ServerConfigBuilder, TEN_MB_SIZE_BYTES};
+pub use config::{DEFAULT_SIZE_LIMIT, ServerConfig, ServerConfigBuilder};
 
 mod handle;
 pub use handle::ServerHandle;

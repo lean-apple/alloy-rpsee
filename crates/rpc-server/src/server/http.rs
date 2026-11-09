@@ -41,8 +41,29 @@ use std::{
     task::{Context, Poll},
 };
 
-/// A boxed error, as HTTP bodies and middleware return.
-pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
+pub use tower::BoxError;
+
+/// An HTTP request as the server and its HTTP middleware see it.
+pub type HttpRequest<B = HttpBody> = http::Request<B>;
+
+/// An HTTP response as the server and its HTTP middleware produce it.
+pub type HttpResponse<B = HttpBody> = http::Response<B>;
+
+// The content type of JSON responses.
+const JSON: &str = "application/json; charset=utf-8";
+
+// The content type of the plain-text errors.
+const TEXT: &str = "text/plain";
+
+// The content types a JSON-RPC request may carry.
+const JSON_CONTENT_TYPES: [&str; 6] = [
+    "application/json",
+    "application/json; charset=utf-8",
+    "application/json;charset=utf-8",
+    "application/json-rpc",
+    "application/json-rpc; charset=utf-8",
+    "application/json-rpc;charset=utf-8",
+];
 
 /// The body of the server's HTTP requests and responses, which HTTP middleware may replace.
 #[derive(Debug, Default)]
@@ -78,28 +99,6 @@ impl Body for HttpBody {
         self.0.size_hint()
     }
 }
-
-/// An HTTP request as the server and its HTTP middleware see it.
-pub type HttpRequest<B = HttpBody> = http::Request<B>;
-
-/// An HTTP response as the server and its HTTP middleware produce it.
-pub type HttpResponse<B = HttpBody> = http::Response<B>;
-
-// The content type of JSON responses.
-const JSON: &str = "application/json; charset=utf-8";
-
-// The content type of the plain-text errors.
-const TEXT: &str = "text/plain";
-
-// The content types a JSON-RPC request may carry.
-const JSON_CONTENT_TYPES: [&str; 6] = [
-    "application/json",
-    "application/json; charset=utf-8",
-    "application/json;charset=utf-8",
-    "application/json-rpc",
-    "application/json-rpc; charset=utf-8",
-    "application/json-rpc;charset=utf-8",
-];
 
 /// Answers one HTTP request through `rpc_service`, reading at most `max_request_size` bytes of
 /// its body.
