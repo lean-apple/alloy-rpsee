@@ -46,38 +46,33 @@ impl MethodResponse {
     /// A larger response becomes `-32008 Response is too big`, and a result that fails to serialize
     /// becomes `-32603 Internal error`.
     pub fn success<T: Serialize + ?Sized>(id: Id, result: &T, max_response_size: usize) -> Self {
-        let mut writer = BoundedWriter::new(max_response_size);
         let response = Response { id, payload: ResponsePayload::<&T, ()>::Success(result) };
-        match serde_json::to_writer(&mut writer, &response) {
-            Ok(()) => match String::from_utf8(writer.into_bytes()) {
-                Ok(json) => Self { json, kind: Kind::Success },
-                // serde_json only writes UTF-8.
-                Err(_) => Self::error(response.id, ErrorCode::InternalError),
-            },
-            // The writer's only IO error is the size limit.
-            Err(err) if err.is_io() => {
-                Self::error(response.id, ErrorCode::OversizedResponse.exceeded(max_response_size))
-            }
-            Err(err) => {
-                tracing::error!(%err, "failed to serialize an RPC result");
-                Self::error(response.id, ErrorCode::InternalError)
-            }
+        match bounded_json(&response, max_response_size) {
+            Ok(json) => Self { json, kind: Kind::Success },
+            Err(err) => Self::error(response.id, err),
         }
     }
 
     /// Serializes an error response to `id`.
     pub fn error(id: Id, err: impl Into<ErrorPayload>) -> Self {
         let err = err.into();
-        // Alloy's `ErrorPayload` writes `"data": null`, while clients expect no `data` when it is
-        // empty.
-        let response = ErrorResponse {
-            jsonrpc: Version::V2,
-            id: &id,
-            error: ErrorBody { code: err.code, message: &err.message, data: err.data.as_deref() },
-        };
-        let json =
-            serde_json::to_string(&response).unwrap_or_else(|_| INTERNAL_ERROR_JSON.to_owned());
+        let json = serde_json::to_string(&ErrorResponse::new(&id, &err))
+            .unwrap_or_else(|_| INTERNAL_ERROR_JSON.to_owned());
         Self { json, kind: Kind::Error }
+    }
+
+    // Serializes an error a method returned to `id`, at most `max_response_size` bytes long. A
+    // larger response becomes `-32008 Response is too big`, like an oversized result.
+    pub(crate) fn bounded_error(
+        id: Id,
+        err: impl Into<ErrorPayload>,
+        max_response_size: usize,
+    ) -> Self {
+        let err = err.into();
+        match bounded_json(&ErrorResponse::new(&id, &err), max_response_size) {
+            Ok(json) => Self { json, kind: Kind::Error },
+            Err(err) => Self::error(id, err),
+        }
     }
 
     /// The answer to a notification, which sends nothing.
@@ -137,7 +132,7 @@ enum Kind {
     Subscription,
 }
 
-// An error response that omits an empty `data`, unlike Alloy's.
+// An error response that leaves out an empty `data`.
 #[derive(Serialize)]
 struct ErrorResponse<'a> {
     // The protocol version.
@@ -146,6 +141,15 @@ struct ErrorResponse<'a> {
     id: &'a Id,
     // The error itself.
     error: ErrorBody<'a>,
+}
+
+impl<'a> ErrorResponse<'a> {
+    // The response carrying `err` to `id`.
+    fn new(id: &'a Id, err: &'a ErrorPayload) -> Self {
+        // `ErrorPayload` writes an empty `data` as `null`, while clients expect it left out.
+        let error = ErrorBody { code: err.code, message: &err.message, data: err.data.as_deref() };
+        Self { jsonrpc: Version::V2, id, error }
+    }
 }
 
 // The `error` member of an `ErrorResponse`.
@@ -158,6 +162,23 @@ struct ErrorBody<'a> {
     // Extra detail, left out when empty.
     #[serde(skip_serializing_if = "Option::is_none")]
     data: Option<&'a RawValue>,
+}
+
+// Serializes `response` in at most `max_len` bytes, or returns the error to answer instead.
+fn bounded_json(response: &impl Serialize, max_len: usize) -> Result<String, ErrorPayload> {
+    let mut writer = BoundedWriter::new(max_len);
+    match serde_json::to_writer(&mut writer, response) {
+        // serde_json only writes UTF-8.
+        Ok(()) => {
+            String::from_utf8(writer.into_bytes()).map_err(|_| ErrorCode::InternalError.into())
+        }
+        // The writer's only IO error is the size limit.
+        Err(err) if err.is_io() => Err(ErrorCode::OversizedResponse.exceeded(max_len)),
+        Err(err) => {
+            tracing::error!(%err, "failed to serialize an RPC response");
+            Err(ErrorCode::InternalError.into())
+        }
+    }
 }
 
 #[cfg(test)]
