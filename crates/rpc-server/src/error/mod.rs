@@ -15,3 +15,8 @@ mod subscription;
 pub use subscription::{
     DisconnectError, PendingSubscriptionAcceptError, SendTimeoutError, TrySendError,
 };
+
+#[cfg(feature = "server")]
+mod server;
+#[cfg(feature = "server")]
+pub use server::AlreadyStoppedError;
