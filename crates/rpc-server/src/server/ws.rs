@@ -39,8 +39,8 @@ use super::{
     split_message,
 };
 use crate::{
-    BatchRequestConfig, ConnectionId, MethodResponse, Request, RpcServiceT, error::ErrorCode,
-    handle_rpc_call,
+    BatchRequestConfig, ConnectionId, MethodResponse, Request, RpcServiceT,
+    batch::BatchResponseBuilder, error::ErrorCode, handle_rpc_call,
 };
 use alloy_json_rpc::Id;
 use bytes::Bytes;
@@ -140,6 +140,7 @@ async fn read_loop<St, S>(
     S: RpcServiceT + Send + Sync + 'static,
 {
     let capacity = usize::try_from(config.message_buffer_capacity).unwrap_or(usize::MAX);
+    let max_response_size = usize::try_from(config.max_response_body_size).unwrap_or(usize::MAX);
     // Bounds the calls running at once, so a client sending faster than it reads waits.
     let slots = Arc::new(Semaphore::new(capacity));
     let calls = TaskTracker::new();
@@ -166,7 +167,7 @@ async fn read_loop<St, S>(
         };
         // Waiting for a slot would stop reading, and with it noticing that the client left.
         let Ok(slot) = slots.clone().try_acquire_owned() else {
-            let Some(busy) = busy(&body) else { continue };
+            let Some(busy) = busy(&body, max_response_size) else { continue };
             match reading.run_until_cancelled(sender.send(busy)).await {
                 Some(Ok(())) => continue,
                 // The connection is closing.
@@ -244,7 +245,7 @@ async fn write_loop<Si>(
 
 // The `-32009 Server is busy` answer to `body`, with one error per call of a batch under its id,
 // or `None` if it holds only notifications, which get no answer.
-fn busy(body: &[u8]) -> Option<String> {
+fn busy(body: &[u8], max_response_size: usize) -> Option<String> {
     let unreadable = || Some(MethodResponse::error(Id::None, ErrorCode::ServerIsBusy).into_json());
     let Some((message, is_single)) = split_message(body) else { return unreadable() };
     if is_single {
@@ -256,12 +257,14 @@ fn busy(body: &[u8]) -> Option<String> {
     if entries.is_empty() {
         return unreadable();
     }
-    let answers = entries
-        .iter()
-        .filter_map(|entry| busy_call(entry.get().as_bytes()))
-        .map(MethodResponse::into_json)
-        .collect::<Vec<_>>();
-    (!answers.is_empty()).then(|| format!("[{}]", answers.join(",")))
+    // Built like any batch answer, so it can't pass the response size limit.
+    let mut answers = BatchResponseBuilder::new(max_response_size);
+    for answer in entries.iter().filter_map(|entry| busy_call(entry.get().as_bytes())) {
+        if let Err(too_big) = answers.append(answer) {
+            return Some(too_big.into_json());
+        }
+    }
+    (!answers.is_empty()).then(|| answers.finish().into_json())
 }
 
 // The busy error for one request, or `None` for a notification. A request that fails to parse is

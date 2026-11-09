@@ -280,3 +280,18 @@ async fn disconnect_cancels_running_calls() {
     handle.stop().unwrap();
     tokio::time::timeout(Duration::from_secs(5), handle.stopped()).await.unwrap();
 }
+
+#[tokio::test]
+async fn busy_answers_respect_the_response_size_limit() {
+    let config =
+        ServerConfig::builder().set_message_buffer_capacity(1).max_response_body_size(128).build();
+    let (addr, _handle, mut ended) = start(config).await;
+    let mut ws = connect(addr).await;
+    ws.send(Message::text(r#"{"jsonrpc":"2.0","id":1,"method":"hang"}"#)).await.unwrap();
+    ended.recv().await.unwrap();
+    let batch = r#"[{"jsonrpc":"2.0","id":2,"method":"eth_chainId"},{"jsonrpc":"2.0","id":3,"method":"eth_chainId"}]"#;
+    assert_eq!(
+        call(&mut ws, batch).await,
+        r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32011,"message":"The batch response was too large","data":"Exceeded max limit of 128"}}"#
+    );
+}
