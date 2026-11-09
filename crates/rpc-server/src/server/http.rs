@@ -66,41 +66,6 @@ const JSON_CONTENT_TYPES: [&str; 6] = [
     "application/json-rpc;charset=utf-8",
 ];
 
-/// The body of the server's HTTP requests and responses, which HTTP middleware may replace.
-#[derive(Debug, Default)]
-pub struct HttpBody(UnsyncBoxBody<Bytes, BoxError>);
-
-impl HttpBody {
-    /// Boxes `body`.
-    pub fn new<B>(body: B) -> Self
-    where
-        B: Body<Data = Bytes> + Send + 'static,
-        B::Error: Into<BoxError>,
-    {
-        Self(body.map_err(Into::into).boxed_unsync())
-    }
-}
-
-impl Body for HttpBody {
-    type Data = Bytes;
-    type Error = BoxError;
-
-    fn poll_frame(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
-        Pin::new(&mut self.0).poll_frame(cx)
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.0.is_end_stream()
-    }
-
-    fn size_hint(&self) -> SizeHint {
-        self.0.size_hint()
-    }
-}
-
 /// Answers one HTTP request through `rpc_service`, reading at most `max_request_size` bytes of
 /// its body.
 pub async fn call_with_service<S: RpcServiceT>(
@@ -141,6 +106,41 @@ pub async fn call_with_service<S: RpcServiceT>(
     let response = handle_rpc_call(message, is_single, batch_config, rpc_service).await;
     // A notification is acknowledged with an empty body.
     json(StatusCode::OK, response.into_json())
+}
+
+/// The body of the server's HTTP requests and responses, which HTTP middleware may replace.
+#[derive(Debug, Default)]
+pub struct HttpBody(UnsyncBoxBody<Bytes, BoxError>);
+
+impl HttpBody {
+    /// Boxes `body`.
+    pub fn new<B>(body: B) -> Self
+    where
+        B: Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<BoxError>,
+    {
+        Self(body.map_err(Into::into).boxed_unsync())
+    }
+}
+
+impl Body for HttpBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+        Pin::new(&mut self.0).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.0.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.0.size_hint()
+    }
 }
 
 // Returns `true` for the content types JSON-RPC clients send.

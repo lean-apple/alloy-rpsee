@@ -329,18 +329,18 @@ where
             let rpc_service = shared.rpc_middleware.service(RpcService::with_connection(
                 shared.methods.clone(),
                 max_response_size,
-                connection.clone(),
+                connection,
             ));
             let ws = ws::WsConnection {
+                id,
                 rpc_service,
-                connection,
-                outgoing,
                 sender,
+                outgoing,
                 config: config.clone(),
                 stop: shared.stop.clone(),
                 permit,
             };
-            let response = ws::upgrade(request, ws, &shared.tasks);
+            let response = ws.upgrade(request, &shared.tasks);
             return Box::pin(async { Ok(response) });
         }
         if !config.enable_http {
