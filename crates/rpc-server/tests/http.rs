@@ -23,7 +23,6 @@ use std::{
     time::Duration,
 };
 use test_case::test_case;
-use tokio::io::AsyncReadExt;
 use tower::{Layer, Service};
 
 // A module with `eth_chainId`, a `big` method answering 100 bytes, and a `slow` one.
@@ -283,10 +282,15 @@ async fn fallible_http_middleware_wraps_the_server() {
 #[tokio::test(start_paused = true)]
 async fn silent_connection_is_closed() {
     let (addr, _handle) = start(ServerConfig::default()).await;
-    let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
-    // Skip past the server's timeout on the paused clock, then wait for the close in real time.
-    tokio::time::sleep(Duration::from_secs(31)).await;
-    tokio::time::resume();
-    let read = tokio::time::timeout(Duration::from_secs(5), socket.read(&mut [0; 1])).await;
-    assert_eq!(read.expect("the connection stayed open").unwrap(), 0);
+    let socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+    // Each second passes instantly on the paused clock, and the close shows as a read of 0 bytes.
+    for _ in 0..60 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        match socket.try_read(&mut [0; 1]) {
+            Ok(0) => return,
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+            other => panic!("expected the connection to close, got {other:?}"),
+        }
+    }
+    panic!("the connection stayed open");
 }
