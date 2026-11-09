@@ -321,7 +321,7 @@ fn respond<R: Serialize, E: Into<ErrorPayload>>(
 ) -> MethodResponse {
     match result {
         Ok(result) => MethodResponse::success(id, &result, max_response_size),
-        Err(err) => MethodResponse::error(id, err),
+        Err(err) => MethodResponse::bounded_error(id, err, max_response_size),
     }
 }
 
@@ -398,6 +398,27 @@ mod tests {
         assert_eq!(
             response.await.into_json(),
             r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32008,"message":"Response is too big","data":"Exceeded max limit of 16"}}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn error_response_is_bounded() {
+        let mut module = RpcModule::new(());
+        module
+            .register_method("revert", |(): (), _| -> Result<(), ErrorPayload> {
+                let data = RawValue::from_string(format!("\"0x{}\"", "00".repeat(2048))).unwrap();
+                Err(ErrorPayload {
+                    code: 3,
+                    message: "execution reverted".into(),
+                    data: Some(data),
+                })
+            })
+            .unwrap();
+        let response =
+            module.method("revert").unwrap().call(Id::Number(1), None, &CallContext::new(256));
+        assert_eq!(
+            response.await.into_json(),
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32008,"message":"Response is too big","data":"Exceeded max limit of 256"}}"#
         );
     }
 
