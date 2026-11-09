@@ -98,7 +98,7 @@ impl BoundedApiServer<u64> for Bounded {
 
 #[rpc(server, namespace = "sub")]
 trait SubApi<T> {
-    #[subscription(name = "subscribe" => "subscription", unsubscribe = "unsubscribe", item = T)]
+    #[subscription(name = "subscribe" => "subscription", item = T)]
     async fn subscribe(&self, start: u64, step: Option<u64>) -> SubscriptionResult;
 
     #[subscription(name = "peerEvents", unsubscribe = "peerEvents_unsubscribe", item = String)]
@@ -269,6 +269,11 @@ async fn subscription_named_like_its_notifications() {
         send(&service, unsubscribe).await.into_json(),
         r#"{"jsonrpc":"2.0","id":2,"result":true}"#
     );
+}
+
+#[test]
+fn unsubscribe_named_after_subscribe() {
+    assert!(Sub.into_rpc().method("sub_unsubscribe").is_some());
 }
 
 #[test]
