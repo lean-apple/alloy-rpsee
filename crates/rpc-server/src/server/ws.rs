@@ -38,8 +38,8 @@ use super::{
     split_message,
 };
 use crate::{
-    BatchRequestConfig, ConnectionId, MethodResponse, RpcServiceT, error::ErrorCode,
-    handle_rpc_call, service::WithId,
+    BatchRequestConfig, ConnectionId, MethodResponse, Request, RpcServiceT, error::ErrorCode,
+    handle_rpc_call,
 };
 use alloy_json_rpc::Id;
 use bytes::Bytes;
@@ -240,15 +240,21 @@ async fn write_loop<Si>(
 // The `-32009 Server is busy` answer to `body`, under its id if it's a single call, or `None` for
 // a notification, which gets no answer.
 fn busy(body: &[u8]) -> Option<String> {
-    let id = match split_message(body) {
-        Some((message, true)) => match serde_json::from_slice::<WithId>(message) {
-            Ok(WithId { id: Some(id) }) => id,
-            Ok(WithId { id: None }) => return None,
-            Err(_) => Id::None,
-        },
-        _ => Id::None,
+    match split_message(body) {
+        Some((message, true)) => busy_call(message).map(MethodResponse::into_json),
+        _ => Some(MethodResponse::error(Id::None, ErrorCode::ServerIsBusy).into_json()),
+    }
+}
+
+// The busy error for one request, or `None` for a notification. A request that fails to parse is
+// answered under a `null` id.
+fn busy_call(message: &[u8]) -> Option<MethodResponse> {
+    let id = match serde_json::from_slice::<Request<'_>>(message) {
+        // An absent id marks a notification, while `"id": null` still expects an answer.
+        Ok(request) => request.id?,
+        Err(_) => Id::None,
     };
-    Some(MethodResponse::error(id, ErrorCode::ServerIsBusy).into_json())
+    Some(MethodResponse::error(id, ErrorCode::ServerIsBusy))
 }
 
 // The JSON to send back for `body`, if any.

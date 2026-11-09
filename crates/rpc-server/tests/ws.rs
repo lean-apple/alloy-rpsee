@@ -206,6 +206,11 @@ async fn calls_past_the_limit_are_busy_and_a_full_connection_still_closes() {
         call(&mut ws, r#"{"jsonrpc":"2.0","id":2,"method":"eth_chainId"}"#).await,
         r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32009,"message":"Server is busy, try again later"}}"#
     );
+    // A null id still expects an answer, unlike a notification.
+    assert_eq!(
+        call(&mut ws, r#"{"jsonrpc":"2.0","id":null,"method":"eth_chainId"}"#).await,
+        r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32009,"message":"Server is busy, try again later"}}"#
+    );
     ws.close(None).await.unwrap();
     let dropped = tokio::time::timeout(Duration::from_secs(5), ended.recv()).await;
     assert!(dropped.expect("the call kept running").is_some());

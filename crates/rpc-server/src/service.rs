@@ -287,12 +287,12 @@ fn recover_id(message: &RawValue) -> Id {
         .unwrap_or(Id::None)
 }
 
-// The `id` member of a request, read without the rest.
+// The `id` member of an invalid request.
 #[derive(Deserialize)]
-pub(crate) struct WithId {
+struct WithId {
     // The id, if the request has one.
     #[serde(default)]
-    pub(crate) id: Option<Id>,
+    id: Option<Id>,
 }
 
 // Calls `request` on `service`, answering a panic with `-32603 Internal error` so the client still
