@@ -18,50 +18,40 @@ use std::{borrow::Cow, fmt};
 /// assert_eq!((err.code, err.message.as_ref()), (INVALID_PARAMS_CODE, "Invalid params"));
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(i64)]
+#[non_exhaustive]
 pub enum ErrorCode {
     /// The request isn't valid JSON.
-    ParseError,
+    ParseError = -32700,
     /// The JSON isn't a valid request.
-    InvalidRequest,
+    InvalidRequest = -32600,
     /// No method has the requested name.
-    MethodNotFound,
+    MethodNotFound = -32601,
     /// The params don't match the method's arguments.
-    InvalidParams,
+    InvalidParams = -32602,
     /// The server failed to answer.
-    InternalError,
+    InternalError = -32603,
     /// The server doesn't accept batches.
-    BatchesNotSupported,
+    BatchesNotSupported = -32005,
     /// The connection reached its subscription limit.
-    TooManySubscriptions,
+    TooManySubscriptions = -32006,
     /// The request exceeds the size limit.
-    OversizedRequest,
+    OversizedRequest = -32007,
     /// The response exceeds the size limit.
-    OversizedResponse,
+    OversizedResponse = -32008,
     /// The server is at capacity.
-    ServerIsBusy,
+    ServerIsBusy = -32009,
     /// The batch has more entries than allowed.
-    TooBigBatchRequest,
+    TooBigBatchRequest = -32010,
     /// The batch's responses exceed the size limit.
-    TooBigBatchResponse,
+    TooBigBatchResponse = -32011,
 }
 
 impl ErrorCode {
     /// Returns the code sent to the client.
     pub const fn code(self) -> i64 {
-        match self {
-            Self::ParseError => -32700,
-            Self::InvalidRequest => -32600,
-            Self::MethodNotFound => -32601,
-            Self::InvalidParams => -32602,
-            Self::InternalError => -32603,
-            Self::BatchesNotSupported => -32005,
-            Self::TooManySubscriptions => -32006,
-            Self::OversizedRequest => -32007,
-            Self::OversizedResponse => -32008,
-            Self::ServerIsBusy => -32009,
-            Self::TooBigBatchRequest => -32010,
-            Self::TooBigBatchResponse => -32011,
-        }
+        // A fieldless `repr(i64)` enum converts to its discriminant without loss.
+        self as i64
     }
 
     /// Returns the message sent to the client.
@@ -129,42 +119,6 @@ pub const TOO_BIG_BATCH_REQUEST_CODE: i64 = ErrorCode::TooBigBatchRequest.code()
 
 /// `-32011`, see [`ErrorCode::TooBigBatchResponse`].
 pub const TOO_BIG_BATCH_RESPONSE_CODE: i64 = ErrorCode::TooBigBatchResponse.code();
-
-/// The message of [`ErrorCode::ParseError`].
-pub const PARSE_ERROR_MSG: &str = ErrorCode::ParseError.message();
-
-/// The message of [`ErrorCode::InvalidRequest`].
-pub const INVALID_REQUEST_MSG: &str = ErrorCode::InvalidRequest.message();
-
-/// The message of [`ErrorCode::MethodNotFound`].
-pub const METHOD_NOT_FOUND_MSG: &str = ErrorCode::MethodNotFound.message();
-
-/// The message of [`ErrorCode::InvalidParams`].
-pub const INVALID_PARAMS_MSG: &str = ErrorCode::InvalidParams.message();
-
-/// The message of [`ErrorCode::InternalError`].
-pub const INTERNAL_ERROR_MSG: &str = ErrorCode::InternalError.message();
-
-/// The message of [`ErrorCode::BatchesNotSupported`].
-pub const BATCHES_NOT_SUPPORTED_MSG: &str = ErrorCode::BatchesNotSupported.message();
-
-/// The message of [`ErrorCode::TooManySubscriptions`].
-pub const TOO_MANY_SUBSCRIPTIONS_MSG: &str = ErrorCode::TooManySubscriptions.message();
-
-/// The message of [`ErrorCode::OversizedRequest`].
-pub const OVERSIZED_REQUEST_MSG: &str = ErrorCode::OversizedRequest.message();
-
-/// The message of [`ErrorCode::OversizedResponse`].
-pub const OVERSIZED_RESPONSE_MSG: &str = ErrorCode::OversizedResponse.message();
-
-/// The message of [`ErrorCode::ServerIsBusy`].
-pub const SERVER_IS_BUSY_MSG: &str = ErrorCode::ServerIsBusy.message();
-
-/// The message of [`ErrorCode::TooBigBatchRequest`].
-pub const TOO_BIG_BATCH_REQUEST_MSG: &str = ErrorCode::TooBigBatchRequest.message();
-
-/// The message of [`ErrorCode::TooBigBatchResponse`].
-pub const TOO_BIG_BATCH_RESPONSE_MSG: &str = ErrorCode::TooBigBatchResponse.message();
 
 #[cfg(test)]
 mod tests {
