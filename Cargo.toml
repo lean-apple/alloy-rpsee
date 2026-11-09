@@ -29,7 +29,13 @@ redundant_clone = "warn"
 alloy-json-rpc = { version = "2.5.0", default-features = false }
 alloy-primitives = { version = "1.7", default-features = false, features = ["map"] }
 alloy-rpc-server = { version = "0.1.0", path = "crates/rpc-server" }
+bytes = { version = "1", default-features = false }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+http = { version = "1", default-features = false }
+http-body = { version = "1", default-features = false }
+http-body-util = { version = "0.1.2", default-features = false }
+hyper = { version = "1.9", default-features = false }
+hyper-util = { version = "0.1.5", default-features = false }
 proc-macro2 = { version = "1", default-features = false, features = ["proc-macro"] }
 quote = { version = "1", default-features = false, features = ["proc-macro"] }
 rand = { version = "0.9", default-features = false, features = ["alloc", "thread_rng"] }
@@ -39,6 +45,7 @@ syn = { version = "2", default-features = false, features = ["clone-impls", "ful
 thiserror = { version = "2", default-features = false }
 tokio = { version = "1", default-features = false }
 tokio-util = { version = "0.7.19", default-features = false }
+tower = { version = "0.5", default-features = false }
 tracing = { version = "0.1", default-features = false }
 
 test-case = { version = "3", default-features = false }

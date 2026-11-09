@@ -23,6 +23,37 @@ tokio = { workspace = true, features = ["rt", "sync", "time"] }
 tokio-util.workspace = true
 tracing.workspace = true
 
+# server
+bytes = { workspace = true, optional = true }
+http = { workspace = true, optional = true }
+http-body = { workspace = true, optional = true }
+http-body-util = { workspace = true, optional = true }
+hyper = { workspace = true, features = ["http1", "http2", "server"], optional = true }
+hyper-util = { workspace = true, features = ["server-auto", "server-graceful", "service", "tokio"], optional = true }
+tower = { workspace = true, features = ["util"], optional = true }
+
 [dev-dependencies]
+http-body-util.workspace = true
+hyper = { workspace = true, features = ["client"] }
+hyper-util = { workspace = true, features = ["client-legacy", "http1", "tokio"] }
 test-case.workspace = true
-tokio = { workspace = true, features = ["macros"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tower.workspace = true
+
+[[test]]
+name = "http"
+required-features = ["server"]
+
+[features]
+default = ["server"]
+server = [
+    "dep:bytes",
+    "dep:http",
+    "dep:http-body",
+    "dep:http-body-util",
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:tower",
+    "tokio/net",
+    "tokio-util/rt",
+]

@@ -149,6 +149,34 @@ impl RpcServiceT for RpcService {
     }
 }
 
+/// Runs one of two services, as `tower::ServiceBuilder::option_layer` builds.
+#[cfg(feature = "server")]
+impl<A: RpcServiceT, B: RpcServiceT> RpcServiceT for tower::util::Either<A, B> {
+    fn call<'a>(&self, request: Request<'a>) -> impl Future<Output = MethodResponse> + Send + 'a {
+        match self {
+            Self::Left(service) => Either::Left(service.call(request)),
+            Self::Right(service) => Either::Right(service.call(request)),
+        }
+    }
+
+    fn batch<'a>(&self, batch: Batch<'a>) -> impl Future<Output = MethodResponse> + Send + 'a {
+        match self {
+            Self::Left(service) => Either::Left(service.batch(batch)),
+            Self::Right(service) => Either::Right(service.batch(batch)),
+        }
+    }
+
+    fn notification<'a>(
+        &self,
+        request: Request<'a>,
+    ) -> impl Future<Output = MethodResponse> + Send + 'a {
+        match self {
+            Self::Left(service) => Either::Left(service.notification(request)),
+            Self::Right(service) => Either::Right(service.notification(request)),
+        }
+    }
+}
+
 /// How batch requests are handled.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum BatchRequestConfig {
