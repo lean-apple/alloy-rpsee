@@ -203,6 +203,11 @@ impl RpcMethod {
         if let Some(default) = &method.default {
             return Err(syn::Error::new(default.span(), "RPC methods can't have a default body"));
         }
+        // The registration in `into_rpc` would still name a method the cfg left out.
+        if let Some(cfg) = method.attrs.iter().find(|attr| attr.path().is_ident("cfg")) {
+            let message = "`#[cfg]` isn't supported on RPC methods, gate the whole trait instead";
+            return Err(syn::Error::new_spanned(cfg, message));
+        }
         let position = method
             .attrs
             .iter()

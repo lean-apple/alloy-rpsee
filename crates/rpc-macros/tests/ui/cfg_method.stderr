@@ -1,0 +1,5 @@
+error: `#[cfg]` isn't supported on RPC methods, gate the whole trait instead
+ --> tests/ui/cfg_method.rs:3:5
+  |
+3 |     #[cfg(any())]
+  |     ^^^^^^^^^^^^^
