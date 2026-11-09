@@ -271,7 +271,11 @@ impl RpcMethod {
         }
         let ident = self.params_ident(item);
         let used = self.used_params(item);
-        let params = item.generics.type_params().filter(|param| used.contains(&param.ident));
+        let params = item
+            .generics
+            .type_params()
+            .filter(|param| used.contains(&param.ident))
+            .collect::<Vec<_>>();
         // Predicates on other parameters can't be stated on this struct.
         let predicates =
             item.generics.where_clause.iter().flat_map(|clause| &clause.predicates).filter(
@@ -288,11 +292,17 @@ impl RpcMethod {
             let default = (i >= required).then(|| quote!(#[serde(default)]));
             quote!(#default #ty)
         });
+        // serde would bound each parameter by `Deserialize<'de>`, which clashes with a trait bound
+        // that already implies `DeserializeOwned`, so the struct states that bound itself.
+        let owned = params.iter().map(|param| &param.ident);
         Some(quote! {
             #[doc(hidden)]
             #[derive(::alloy_rpc_server::__private::serde::Deserialize)]
-            #[serde(crate = "::alloy_rpc_server::__private::serde")]
-            struct #ident<#(#params),*>(#(#fields),*) where #(#predicates,)*;
+            #[serde(crate = "::alloy_rpc_server::__private::serde", bound(deserialize = ""))]
+            struct #ident<#(#params),*>(#(#fields),*)
+            where
+                #(#predicates,)*
+                #(#owned: ::alloy_rpc_server::__private::serde::de::DeserializeOwned,)*;
         })
     }
 
