@@ -403,7 +403,8 @@ fn answer_call(answer: oneshot::Sender<MethodResponse>, response: MethodResponse
 /// An accepted subscription, which sends notifications to the client.
 ///
 /// Clones send on the same subscription, which ends when the client unsubscribes, the connection
-/// closes, or the last clone is dropped.
+/// closes, or the last clone is dropped. A notification past the server's response size limit
+/// isn't sent and ends the subscription.
 #[derive(Debug, Clone)]
 pub struct SubscriptionSink {
     // Shared by every clone, and torn down with the last one.
@@ -436,14 +437,14 @@ impl SubscriptionSink {
         if self.is_closed() {
             return Err(DisconnectError(msg));
         }
-        // Waiting for room before serializing keeps `msg` to hand back if the subscription ends.
+        let json = self.inner.notification(msg).map_err(DisconnectError)?;
         let reserve = self.inner.connection.inner.sender.reserve();
         match self.inner.unsubscribed.run_until_cancelled(reserve).await {
             Some(Ok(slot)) => {
-                slot.send(msg.into_json(&self.inner));
+                slot.send(json);
                 Ok(())
             }
-            Some(Err(_)) | None => Err(DisconnectError(msg)),
+            Some(Err(_)) | None => Err(DisconnectError(complete(json))),
         }
     }
 
@@ -461,7 +462,7 @@ impl SubscriptionSink {
         if self.is_closed() {
             return Err(SendTimeoutError::Closed(msg));
         }
-        let json = msg.into_json(&self.inner);
+        let json = self.inner.notification(msg).map_err(SendTimeoutError::Closed)?;
         self.inner.connection.inner.sender.send_timeout(json, timeout).await.map_err(
             |err| match err {
                 mpsc::error::SendTimeoutError::Timeout(json) => {
@@ -484,7 +485,7 @@ impl SubscriptionSink {
         if self.is_closed() {
             return Err(TrySendError::Closed(msg));
         }
-        let json = msg.into_json(&self.inner);
+        let json = self.inner.notification(msg).map_err(TrySendError::Closed)?;
         self.inner.connection.inner.sender.try_send(json).map_err(|err| match err {
             mpsc::error::TrySendError::Full(json) => TrySendError::Full(complete(json)),
             mpsc::error::TrySendError::Closed(json) => TrySendError::Closed(complete(json)),
@@ -533,10 +534,34 @@ pub(crate) struct SinkInner {
     pub(crate) connection: Connection,
     // Cancelled when the client unsubscribes.
     pub(crate) unsubscribed: CancellationToken,
-    // The most bytes the subscription id response may take.
+    // The most bytes the subscription id response and each notification may take.
     pub(crate) max_response_size: usize,
     // Frees the subscription's slot on the connection when dropped.
     pub(crate) _permit: OwnedSemaphorePermit,
+}
+
+impl SinkInner {
+    // The notification carrying `msg`, or `msg` back past the response size limit, which ends the
+    // subscription with an error notification so the client learns why.
+    fn notification(&self, msg: SubscriptionMessage) -> Result<String, SubscriptionMessage> {
+        let json = msg.into_json(self);
+        if json.len() <= self.max_response_size {
+            return Ok(json);
+        }
+        self.unsubscribed.cancel();
+        let reason = format!("Exceeded max limit of {}", self.max_response_size);
+        let notification = Notification::new(
+            self.method,
+            &self.subscription_id,
+            NotificationPayload::<()>::Error(reason),
+        );
+        // A string always serializes. A full queue drops the reason, as the client isn't reading.
+        let reason = serde_json::to_string(&notification).unwrap_or_default();
+        if self.connection.inner.sender.try_send(reason).is_err() {
+            tracing::debug!(method = self.method, "no room to end an oversized subscription");
+        }
+        Err(complete(json))
+    }
 }
 
 impl Drop for SinkInner {
@@ -619,6 +644,14 @@ mod tests {
 
     impl Client {
         fn new(max_subscriptions: u32, queue: usize) -> Self {
+            Self::with_max_response_size(max_subscriptions, queue, usize::MAX)
+        }
+
+        fn with_max_response_size(
+            max_subscriptions: u32,
+            queue: usize,
+            max_response_size: usize,
+        ) -> Self {
             let kept = Arc::new(Kept::default());
             let mut module = RpcModule::new(kept.clone());
             module
@@ -663,7 +696,7 @@ mod tests {
                 Arc::new(Counter::default()),
             );
             Self {
-                service: RpcService::with_connection(module, usize::MAX, connection),
+                service: RpcService::with_connection(module, max_response_size, connection),
                 received,
                 kept,
             }
@@ -798,6 +831,22 @@ mod tests {
             sink.send(SubscriptionMessage::from(raw("1"))).await,
             Err(DisconnectError(_))
         ));
+        assert!(matches!(sink.try_send(raw("1")), Err(TrySendError::Closed(_))));
+    }
+
+    #[tokio::test]
+    async fn oversized_notification_ends_the_subscription() {
+        let mut client = Client::with_max_response_size(8, 8, 128);
+        client.subscribe("keep").await;
+        client.recv().await;
+        let sink = client.sink();
+        let big = raw(&format!(r#""{}""#, "x".repeat(256)));
+        assert!(matches!(sink.send(SubscriptionMessage::from(big)).await, Err(DisconnectError(_))));
+        assert_eq!(
+            client.recv().await,
+            r#"{"jsonrpc":"2.0","method":"test_notification","params":{"subscription":1,"error":"Exceeded max limit of 128"}}"#
+        );
+        assert!(sink.is_closed());
         assert!(matches!(sink.try_send(raw("1")), Err(TrySendError::Closed(_))));
     }
 
