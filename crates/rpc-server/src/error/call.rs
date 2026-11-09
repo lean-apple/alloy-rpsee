@@ -24,7 +24,8 @@ pub enum InvalidParams {
 
 impl From<InvalidParams> for ErrorPayload {
     fn from(err: InvalidParams) -> Self {
-        let mut message = without_positions(&err.to_string());
+        let mut message = err.to_string();
+        strip_positions(&mut message);
         if message.len() > MAX_ERROR_MESSAGE_LEN {
             message.truncate(message.floor_char_boundary(MAX_ERROR_MESSAGE_LEN));
             message.push('…');
@@ -33,19 +34,22 @@ impl From<InvalidParams> for ErrorPayload {
     }
 }
 
-// The message without the ` at line L column C` positions serde_json appends, which point into
-// the params rather than the client's request.
-fn without_positions(message: &str) -> String {
-    let mut message = message;
+// Removes the ` at line L column C` positions serde_json appends, which point into the params
+// rather than the client's request.
+fn strip_positions(message: &mut String) {
     while let Some(start) = message.rfind(" at line ")
-        && let Some((line, column)) =
-            message[start..].trim_start_matches(" at line ").split_once(" column ")
-        && is_number(line)
-        && is_number(column)
+        && is_position(&message[start..])
     {
-        message = &message[..start];
+        message.truncate(start);
     }
-    message.to_owned()
+}
+
+// Returns `true` for exactly ` at line L column C`.
+fn is_position(suffix: &str) -> bool {
+    suffix
+        .strip_prefix(" at line ")
+        .and_then(|rest| rest.split_once(" column "))
+        .is_some_and(|(line, column)| is_number(line) && is_number(column))
 }
 
 // Returns `true` for a non-empty run of ASCII digits.
@@ -115,6 +119,8 @@ mod tests {
     #[test_case(r#"string "at line 1 column 2""#, r#"string "at line 1 column 2""# ; "position inside a value")]
     #[test_case("no position", "no position" ; "none")]
     fn positions_are_dropped(message: &str, expected: &str) {
-        assert_eq!(without_positions(message), expected);
+        let mut message = message.to_owned();
+        strip_positions(&mut message);
+        assert_eq!(message, expected);
     }
 }
