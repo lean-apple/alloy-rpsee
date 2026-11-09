@@ -437,16 +437,13 @@ impl SubscriptionSink {
             return Err(DisconnectError(msg));
         }
         // Waiting for room before serializing keeps `msg` to hand back if the subscription ends.
-        let slot = tokio::select! {
-            slot = self.inner.connection.inner.sender.reserve() => slot,
-            () = self.inner.unsubscribed.cancelled() => return Err(DisconnectError(msg)),
-        };
-        match slot {
-            Ok(slot) => {
+        let reserve = self.inner.connection.inner.sender.reserve();
+        match self.inner.unsubscribed.run_until_cancelled(reserve).await {
+            Some(Ok(slot)) => {
                 slot.send(msg.into_json(&self.inner));
                 Ok(())
             }
-            Err(_) => Err(DisconnectError(msg)),
+            Some(Err(_)) | None => Err(DisconnectError(msg)),
         }
     }
 
@@ -501,10 +498,10 @@ impl SubscriptionSink {
 
     /// Waits until the client unsubscribes or the connection closes.
     pub async fn closed(&self) {
-        tokio::select! {
-            () = self.inner.unsubscribed.cancelled() => {}
-            () = self.inner.connection.inner.sender.closed() => {}
-        }
+        self.inner
+            .unsubscribed
+            .run_until_cancelled(self.inner.connection.inner.sender.closed())
+            .await;
     }
 
     /// Returns how many more messages the connection's queue takes right now.

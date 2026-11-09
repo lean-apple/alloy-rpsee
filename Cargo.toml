@@ -38,7 +38,7 @@ serde_json = { version = "1.0", default-features = false, features = ["raw_value
 syn = { version = "2", default-features = false, features = ["clone-impls", "full", "parsing", "printing", "proc-macro", "visit"] }
 thiserror = { version = "2", default-features = false }
 tokio = { version = "1", default-features = false }
-tokio-util = { version = "0.7", default-features = false }
+tokio-util = { version = "0.7.19", default-features = false }
 tracing = { version = "0.1", default-features = false }
 
 test-case = { version = "3", default-features = false }
