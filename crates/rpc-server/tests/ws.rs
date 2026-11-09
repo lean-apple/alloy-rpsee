@@ -195,15 +195,22 @@ async fn oversized_message_is_answered_then_closed() {
 }
 
 #[tokio::test]
-async fn calls_wait_for_a_free_slot() {
-    let (addr, _handle, _) =
+async fn calls_past_the_limit_are_busy_and_a_full_connection_still_closes() {
+    let (addr, handle, mut ended) =
         start(ServerConfig::builder().set_message_buffer_capacity(1).build()).await;
     let mut ws = connect(addr).await;
-    ws.send(Message::text(r#"{"jsonrpc":"2.0","id":1,"method":"slow"}"#)).await.unwrap();
-    ws.send(Message::text(r#"{"jsonrpc":"2.0","id":2,"method":"eth_chainId"}"#)).await.unwrap();
-    // With one slot, the second call only starts once the first is answered.
-    assert_eq!(recv(&mut ws).await, r#"{"jsonrpc":"2.0","id":1,"result":"done"}"#);
-    assert_eq!(recv(&mut ws).await, r#"{"jsonrpc":"2.0","id":2,"result":"0x1"}"#);
+    ws.send(Message::text(r#"{"jsonrpc":"2.0","id":1,"method":"hang"}"#)).await.unwrap();
+    ended.recv().await.unwrap();
+    // The only slot is taken, so the next call is refused rather than waited for.
+    assert_eq!(
+        call(&mut ws, r#"{"jsonrpc":"2.0","id":2,"method":"eth_chainId"}"#).await,
+        r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32009,"message":"Server is busy, try again later"}}"#
+    );
+    ws.close(None).await.unwrap();
+    let dropped = tokio::time::timeout(Duration::from_secs(5), ended.recv()).await;
+    assert!(dropped.expect("the call kept running").is_some());
+    handle.stop().unwrap();
+    tokio::time::timeout(Duration::from_secs(5), handle.stopped()).await.unwrap();
 }
 
 #[tokio::test]

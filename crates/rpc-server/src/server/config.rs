@@ -150,7 +150,8 @@ impl ServerConfigBuilder {
     }
 
     /// Sets how many messages may wait to be sent on one WebSocket connection, which also bounds
-    /// the calls it runs at once. Defaults to 1024.
+    /// the calls it runs at once. Calls past it are answered with `-32009 Server is busy`.
+    /// Defaults to 1024.
     pub const fn set_message_buffer_capacity(mut self, capacity: u32) -> Self {
         self.0.message_buffer_capacity = capacity;
         self

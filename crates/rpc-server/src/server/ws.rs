@@ -27,9 +27,10 @@
 //! Serving one WebSocket connection.
 //!
 //! The connection reads requests and runs each as its own call, at most
-//! `message_buffer_capacity` at once, while a writer sends answers and subscription
-//! notifications from the connection's bounded queue. A write that takes longer than the write
-//! timeout closes the connection, so a client that stops reading can't hold its messages.
+//! `message_buffer_capacity` at once, answering more with `-32009 Server is busy`, while a writer
+//! sends answers and subscription notifications from the connection's bounded queue. A write that
+//! takes longer than the write timeout closes the connection, so a client that stops reading can't
+//! hold its messages.
 
 use super::{
     ServerConfig,
@@ -38,7 +39,7 @@ use super::{
 };
 use crate::{
     BatchRequestConfig, ConnectionId, MethodResponse, RpcServiceT, error::ErrorCode,
-    handle_rpc_call,
+    handle_rpc_call, service::WithId,
 };
 use alloy_json_rpc::Id;
 use bytes::Bytes;
@@ -157,9 +158,14 @@ async fn read_loop<St, S>(
                 break;
             }
         };
-        let Some(Ok(slot)) = reading.run_until_cancelled(slots.clone().acquire_owned()).await
-        else {
-            break;
+        // Waiting for a slot would stop reading, and with it noticing that the client left.
+        let Ok(slot) = slots.clone().try_acquire_owned() else {
+            let Some(busy) = busy(&body) else { continue };
+            match reading.run_until_cancelled(sender.send(busy)).await {
+                Some(Ok(())) => continue,
+                // The connection is closing.
+                _ => break,
+            }
         };
         let (rpc_service, sender, batch_config, disconnected) = (
             rpc_service.clone(),
@@ -229,6 +235,20 @@ async fn write_loop<Si>(
     if !timed_out {
         let _ = tokio::time::timeout(write_timeout, sink.close()).await;
     }
+}
+
+// The `-32009 Server is busy` answer to `body`, under its id if it's a single call, or `None` for
+// a notification, which gets no answer.
+fn busy(body: &[u8]) -> Option<String> {
+    let id = match split_message(body) {
+        Some((message, true)) => match serde_json::from_slice::<WithId>(message) {
+            Ok(WithId { id: Some(id) }) => id,
+            Ok(WithId { id: None }) => return None,
+            Err(_) => Id::None,
+        },
+        _ => Id::None,
+    };
+    Some(MethodResponse::error(id, ErrorCode::ServerIsBusy).into_json())
 }
 
 // The JSON to send back for `body`, if any.
