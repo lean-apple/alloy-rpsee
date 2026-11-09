@@ -77,6 +77,25 @@ where
     }
 }
 
+/// A bound that implies `DeserializeOwned`, like an RPC object type.
+trait RpcObject: Serialize + DeserializeOwned + Send + Sync + 'static {}
+
+impl RpcObject for u64 {}
+
+#[rpc(server, namespace = "bounded")]
+trait BoundedApi<T: RpcObject> {
+    #[method(name = "echo")]
+    fn echo(&self, value: T) -> RpcResult<T>;
+}
+
+struct Bounded;
+
+impl BoundedApiServer<u64> for Bounded {
+    fn echo(&self, value: u64) -> RpcResult<u64> {
+        Ok(value)
+    }
+}
+
 #[rpc(server, namespace = "sub")]
 trait SubApi<T> {
     #[subscription(name = "subscribe" => "subscription", unsubscribe = "unsubscribe", item = T)]
@@ -209,6 +228,13 @@ async fn method_error_is_answered() {
 async fn generic_trait() {
     let module = Generic::<u32, u64>(PhantomData).into_rpc();
     let request = r#"{"jsonrpc":"2.0","id":1,"method":"generic_convert","params":[7]}"#;
+    assert_eq!(module.raw_json_request(request).await, result("7"));
+}
+
+#[tokio::test]
+async fn trait_bound_implying_deserialize_owned() {
+    let module = BoundedApiServer::<u64>::into_rpc(Bounded);
+    let request = r#"{"jsonrpc":"2.0","id":1,"method":"bounded_echo","params":[7]}"#;
     assert_eq!(module.raw_json_request(request).await, result("7"));
 }
 
