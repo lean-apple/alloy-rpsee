@@ -28,7 +28,8 @@
 //!
 //! A request is a `POST` with a JSON content type carrying one JSON-RPC message or a batch.
 //! Anything else gets an HTTP error: `405` for other methods, `415` for other content types,
-//! `413` past the size limit and `400` for a body that isn't JSON.
+//! `413` past the size limit, `408` for a body that doesn't arrive within 30 seconds and `400` for
+//! a body that isn't JSON.
 
 use super::split_message;
 use crate::{BatchRequestConfig, MethodResponse, RpcServiceT, error::ErrorCode, handle_rpc_call};
@@ -40,6 +41,7 @@ use http_body_util::{BodyExt, Full, LengthLimitError, Limited, combinators::Unsy
 use std::{
     pin::Pin,
     task::{Context, Poll},
+    time::Duration,
 };
 
 pub use tower::BoxError;
@@ -49,6 +51,9 @@ pub type HttpRequest<B = HttpBody> = http::Request<B>;
 
 /// An HTTP response as the server and its HTTP middleware produce it.
 pub type HttpResponse<B = HttpBody> = http::Response<B>;
+
+// How long a request's body may take to arrive, so a client that stops sending it frees its slot.
+const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 // The content type of JSON responses.
 const JSON: &str = "application/json; charset=utf-8";
@@ -92,13 +97,15 @@ pub async fn call_with_service<S: RpcServiceT>(
     if usize::try_from(body.size_hint().lower()).unwrap_or(usize::MAX) > limit {
         return too_large(max_request_size);
     }
-    let body = match Limited::new(body, limit).collect().await {
-        Ok(body) => body.to_bytes(),
-        Err(err) if err.is::<LengthLimitError>() => return too_large(max_request_size),
-        Err(err) => {
+    let read = tokio::time::timeout(BODY_READ_TIMEOUT, Limited::new(body, limit).collect());
+    let body = match read.await {
+        Ok(Ok(body)) => body.to_bytes(),
+        Ok(Err(err)) if err.is::<LengthLimitError>() => return too_large(max_request_size),
+        Ok(Err(err)) => {
             tracing::debug!(%err, "failed to read an HTTP request body");
             return error(StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::InternalError.into());
         }
+        Err(_) => return text(StatusCode::REQUEST_TIMEOUT, "Request body not received in time\n"),
     };
     let Some((message, is_single)) = split_message(&body) else {
         return error(StatusCode::BAD_REQUEST, ErrorCode::ParseError.into());
