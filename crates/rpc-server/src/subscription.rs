@@ -463,16 +463,16 @@ impl SubscriptionSink {
             return Err(SendTimeoutError::Closed(msg));
         }
         let json = self.inner.notification(msg).map_err(SendTimeoutError::Closed)?;
-        self.inner.connection.inner.sender.send_timeout(json, timeout).await.map_err(
-            |err| match err {
-                mpsc::error::SendTimeoutError::Timeout(json) => {
-                    SendTimeoutError::Timeout(complete(json))
-                }
-                mpsc::error::SendTimeoutError::Closed(json) => {
-                    SendTimeoutError::Closed(complete(json))
-                }
-            },
-        )
+        let reserve = tokio::time::timeout(timeout, self.inner.connection.inner.sender.reserve());
+        // Like `send`, an unsubscribe ends the wait.
+        match self.inner.unsubscribed.run_until_cancelled(reserve).await {
+            Some(Ok(Ok(slot))) => {
+                slot.send(json);
+                Ok(())
+            }
+            Some(Err(_)) => Err(SendTimeoutError::Timeout(complete(json))),
+            Some(Ok(Err(_))) | None => Err(SendTimeoutError::Closed(complete(json))),
+        }
     }
 
     /// Sends `msg` if the connection's queue has room.
@@ -832,6 +832,19 @@ mod tests {
             Err(DisconnectError(_))
         ));
         assert!(matches!(sink.try_send(raw("1")), Err(TrySendError::Closed(_))));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unsubscribe_ends_a_waiting_send_timeout() {
+        let mut client = Client::new(8, 1);
+        client.subscribe("keep").await;
+        let sink = client.sink();
+        // The subscription id answer fills the queue, so the send waits for room.
+        let send = sink.send_timeout(raw("1"), Duration::from_secs(60));
+        let (sent, _) = tokio::join!(send, client.unsubscribe("1"));
+        assert!(matches!(sent, Err(SendTimeoutError::Closed(_))));
+        client.recv().await;
+        assert!(client.received.try_recv().is_err());
     }
 
     #[tokio::test]
