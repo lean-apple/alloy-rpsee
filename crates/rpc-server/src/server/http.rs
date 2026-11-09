@@ -123,6 +123,15 @@ impl HttpBody {
     }
 }
 
+impl<T> From<T> for HttpBody
+where
+    Full<Bytes>: From<T>,
+{
+    fn from(body: T) -> Self {
+        Self::new(Full::from(body))
+    }
+}
+
 impl Body for HttpBody {
     type Data = Bytes;
     type Error = BoxError;
@@ -183,4 +192,16 @@ fn response(status: StatusCode, body: Full<Bytes>, content_type: &'static str) -
     *response.status_mut() = status;
     response.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn body_from_text_and_bytes() {
+        for body in [HttpBody::from("hello"), HttpBody::from(Bytes::from_static(b"hello"))] {
+            assert_eq!(body.collect().await.unwrap().to_bytes(), "hello");
+        }
+    }
 }
