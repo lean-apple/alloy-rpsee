@@ -30,6 +30,7 @@
 //! Anything else gets an HTTP error: `405` for other methods, `415` for other content types,
 //! `413` past the size limit and `400` for a body that isn't JSON.
 
+use super::split_message;
 use crate::{BatchRequestConfig, MethodResponse, RpcServiceT, error::ErrorCode, handle_rpc_call};
 use alloy_json_rpc::{ErrorPayload, Id};
 use bytes::Bytes;
@@ -134,15 +135,10 @@ pub async fn call_with_service<S: RpcServiceT>(
             return error(StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::InternalError.into());
         }
     };
-    // The first byte past any whitespace tells one message from a batch.
-    let start = body.iter().position(|byte| !byte.is_ascii_whitespace()).unwrap_or(body.len());
-    let is_single = match body.get(start) {
-        Some(b'{') => true,
-        Some(b'[') => false,
-        _ => return error(StatusCode::BAD_REQUEST, ErrorCode::ParseError.into()),
+    let Some((message, is_single)) = split_message(&body) else {
+        return error(StatusCode::BAD_REQUEST, ErrorCode::ParseError.into());
     };
-    let message = body.slice(start..);
-    let response = handle_rpc_call(&message, is_single, batch_config, rpc_service).await;
+    let response = handle_rpc_call(message, is_single, batch_config, rpc_service).await;
     // A notification is acknowledged with an empty body.
     json(StatusCode::OK, response.into_json())
 }
@@ -167,6 +163,13 @@ fn error(status: StatusCode, err: ErrorPayload) -> HttpResponse {
 // A JSON body.
 fn json(status: StatusCode, body: String) -> HttpResponse {
     response(status, Full::from(body), JSON)
+}
+
+// A response without a body.
+pub(crate) fn empty(status: StatusCode) -> HttpResponse {
+    let mut response = HttpResponse::new(HttpBody::default());
+    *response.status_mut() = status;
+    response
 }
 
 // A plain-text body.

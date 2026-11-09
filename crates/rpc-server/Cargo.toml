@@ -30,6 +30,7 @@ http-body = { workspace = true, optional = true }
 http-body-util = { workspace = true, optional = true }
 hyper = { workspace = true, features = ["http1", "http2", "server"], optional = true }
 hyper-util = { workspace = true, features = ["server-auto", "server-graceful", "service", "tokio"], optional = true }
+tokio-tungstenite = { workspace = true, optional = true }
 tower = { workspace = true, features = ["util"], optional = true }
 
 [dev-dependencies]
@@ -38,10 +39,15 @@ hyper = { workspace = true, features = ["client"] }
 hyper-util = { workspace = true, features = ["client-legacy", "http1", "tokio"] }
 test-case.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio-tungstenite = { workspace = true, features = ["connect"] }
 tower.workspace = true
 
 [[test]]
 name = "http"
+required-features = ["server"]
+
+[[test]]
+name = "ws"
 required-features = ["server"]
 
 [features]
@@ -53,7 +59,9 @@ server = [
     "dep:http-body-util",
     "dep:hyper",
     "dep:hyper-util",
+    "dep:tokio-tungstenite",
     "dep:tower",
+    "futures-util/sink",
     "tokio/net",
     "tokio-util/rt",
 ]

@@ -29,8 +29,9 @@
 use super::{
     ServerConfig, ServerHandle,
     http::{self, BoxError, HttpBody, HttpRequest, HttpResponse},
+    ws,
 };
-use crate::{Methods, RpcService, RpcServiceT};
+use crate::{Connection, ConnectionId, Methods, RpcService, RpcServiceT};
 use bytes::Bytes;
 use futures_util::future::BoxFuture;
 use http_body::Body;
@@ -44,13 +45,16 @@ use std::{
     convert::Infallible,
     io,
     net::SocketAddr,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     task::{Context, Poll},
     time::Duration,
 };
 use tokio::{
     net::{TcpListener, ToSocketAddrs},
-    sync::Semaphore,
+    sync::{Semaphore, mpsc},
 };
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tower::{Layer, Service, ServiceBuilder, ServiceExt, layer::util::Identity};
@@ -209,7 +213,15 @@ where
             self;
         let connections =
             Arc::new(Semaphore::new(usize::try_from(config.max_connections).unwrap_or(usize::MAX)));
-        let shared = Arc::new(Shared { methods, config, rpc_middleware, connections });
+        let shared = Arc::new(Shared {
+            methods,
+            config,
+            rpc_middleware,
+            connections,
+            next_connection_id: AtomicUsize::new(0),
+            stop: stop.clone(),
+            tasks: tasks.clone(),
+        });
         let mut hyper = auto::Builder::new(TokioExecutor::new());
         // A timer turns on hyper's header read timeout, which closes connections that send no
         // request.
@@ -230,8 +242,10 @@ where
             let service = http_middleware.service(HttpService { shared: shared.clone() });
             let service =
                 service.map_request(|request: hyper::Request<Incoming>| request.map(HttpBody::new));
-            let connection =
-                hyper.serve_connection(TokioIo::new(socket), TowerToHyperService::new(service));
+            let connection = hyper.serve_connection_with_upgrades(
+                TokioIo::new(socket),
+                TowerToHyperService::new(service),
+            );
             let connection = graceful.watch(connection.into_owned());
             tasks.spawn(async move {
                 if let Err(err) = connection.await {
@@ -253,8 +267,14 @@ struct Shared<RpcMiddleware> {
     config: ServerConfig,
     // Layers wrapping each JSON-RPC call.
     rpc_middleware: RpcServiceBuilder<RpcMiddleware>,
-    // One permit per request that may still be answered at once.
+    // One permit per HTTP request in flight or open WebSocket connection.
     connections: Arc<Semaphore>,
+    // The id the next WebSocket connection gets.
+    next_connection_id: AtomicUsize,
+    // Cancelled when the server stops.
+    stop: CancellationToken,
+    // The server's connections, which stopping waits for.
+    tasks: TaskTracker,
 }
 
 /// The service answering HTTP requests, which the HTTP middleware wraps.
@@ -290,14 +310,44 @@ where
             let busy = "Too many connections. Please try again later.";
             return Box::pin(async move { Ok(http::text(StatusCode::TOO_MANY_REQUESTS, busy)) });
         };
+        let config = &shared.config;
+        let max_response_size =
+            usize::try_from(config.max_response_body_size).unwrap_or(usize::MAX);
+        if ws::is_upgrade_request(request.headers()) {
+            if !config.enable_ws {
+                return Box::pin(async { Ok(http::empty(StatusCode::FORBIDDEN)) });
+            }
+            let capacity = usize::try_from(config.message_buffer_capacity).unwrap_or(usize::MAX);
+            let (sender, outgoing) = mpsc::channel(capacity);
+            let id = ConnectionId(shared.next_connection_id.fetch_add(1, Ordering::Relaxed));
+            let connection = Connection::new(
+                id,
+                sender.clone(),
+                config.max_subscriptions_per_connection,
+                config.id_provider.clone(),
+            );
+            let rpc_service = shared.rpc_middleware.service(RpcService::with_connection(
+                shared.methods.clone(),
+                max_response_size,
+                connection.clone(),
+            ));
+            let ws = ws::WsConnection {
+                rpc_service,
+                connection,
+                outgoing,
+                sender,
+                config: config.clone(),
+                stop: shared.stop.clone(),
+                permit,
+            };
+            let response = ws::upgrade(request, ws, &shared.tasks);
+            return Box::pin(async { Ok(response) });
+        }
+        if !config.enable_http {
+            return Box::pin(async { Ok(http::empty(StatusCode::FORBIDDEN)) });
+        }
         Box::pin(async move {
-            let ServerConfig {
-                max_request_body_size,
-                max_response_body_size,
-                batch_requests_config,
-                ..
-            } = shared.config;
-            let max_response_size = usize::try_from(max_response_body_size).unwrap_or(usize::MAX);
+            let ServerConfig { max_request_body_size, batch_requests_config, .. } = shared.config;
             let rpc_service = shared
                 .rpc_middleware
                 .service(RpcService::new(shared.methods.clone(), max_response_size));
