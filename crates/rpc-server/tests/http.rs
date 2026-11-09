@@ -23,6 +23,7 @@ use std::{
     time::Duration,
 };
 use test_case::test_case;
+use tokio::io::AsyncReadExt;
 use tower::{Layer, Service};
 
 // A module with `eth_chainId`, a `big` method answering 100 bytes, and a `slow` one.
@@ -277,4 +278,15 @@ async fn fallible_http_middleware_wraps_the_server() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(body, r#"{"jsonrpc":"2.0","id":1,"result":"0x1"}"#);
+}
+
+#[tokio::test(start_paused = true)]
+async fn silent_connection_is_closed() {
+    let (addr, _handle) = start(ServerConfig::default()).await;
+    let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+    // Skip past the server's timeout on the paused clock, then wait for the close in real time.
+    tokio::time::sleep(Duration::from_secs(31)).await;
+    tokio::time::resume();
+    let read = tokio::time::timeout(Duration::from_secs(5), socket.read(&mut [0; 1])).await;
+    assert_eq!(read.expect("the connection stayed open").unwrap(), 0);
 }

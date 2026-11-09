@@ -33,7 +33,7 @@ use super::{
 };
 use crate::{Connection, ConnectionId, Methods, RpcService, RpcServiceT};
 use bytes::Bytes;
-use futures_util::future::BoxFuture;
+use futures_util::future::{self, BoxFuture, Either};
 use http_body::Body;
 use hyper::{StatusCode, body::Incoming};
 use hyper_util::{
@@ -44,6 +44,7 @@ use hyper_util::{
 use std::{
     io,
     net::SocketAddr,
+    pin::pin,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -53,13 +54,16 @@ use std::{
 };
 use tokio::{
     net::{TcpListener, ToSocketAddrs},
-    sync::{Semaphore, mpsc},
+    sync::{Notify, Semaphore, mpsc},
 };
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tower::{Layer, Service, ServiceBuilder, ServiceExt, layer::util::Identity};
 
 // How long to wait after a failed accept, so a full file table doesn't spin the accept loop.
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
+
+// How long a connection may stay open without sending a request.
+const FIRST_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Layers of RPC middleware, each wrapping an [`RpcServiceT`].
 pub type RpcServiceBuilder<L = Identity> = ServiceBuilder<L>;
@@ -241,16 +245,34 @@ where
                 shared: shared.clone(),
                 rpc_middleware: rpc_middleware.clone(),
             });
-            let service =
-                service.map_request(|request: hyper::Request<Incoming>| request.map(HttpBody::new));
+            let request_received = Arc::new(Notify::new());
+            let service = service.map_request({
+                let request_received = request_received.clone();
+                move |request: hyper::Request<Incoming>| {
+                    request_received.notify_one();
+                    request.map(HttpBody::new)
+                }
+            });
             let connection = hyper.serve_connection_with_upgrades(
                 TokioIo::new(socket),
                 TowerToHyperService::new(service),
             );
             let connection = graceful.watch(connection.into_owned());
             tasks.spawn(async move {
-                if let Err(err) = connection.await {
-                    tracing::debug!(%err, "HTTP connection failed");
+                // hyper's header timeout starts only once it has read enough to choose between
+                // HTTP/1 and HTTP/2, so it misses a connection that sends nothing.
+                let no_request = async {
+                    let first = request_received.notified();
+                    if tokio::time::timeout(FIRST_REQUEST_TIMEOUT, first).await.is_ok() {
+                        future::pending::<()>().await;
+                    }
+                };
+                match future::select(pin!(connection), pin!(no_request)).await {
+                    Either::Left((Err(err), _)) => tracing::debug!(%err, "HTTP connection failed"),
+                    Either::Left((Ok(()), _)) => {}
+                    Either::Right(((), _)) => {
+                        tracing::debug!("closed a connection with no request")
+                    }
                 }
             });
         }

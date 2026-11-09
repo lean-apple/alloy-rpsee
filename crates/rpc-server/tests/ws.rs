@@ -211,3 +211,16 @@ async fn stop_answers_running_calls_then_closes() {
     assert_eq!(recv(&mut ws).await, r#"{"jsonrpc":"2.0","id":1,"result":"done"}"#);
     tokio::time::timeout(Duration::from_secs(5), handle.clone().stopped()).await.unwrap();
 }
+
+#[tokio::test(start_paused = true)]
+async fn idle_connection_stays_open_after_its_first_request() {
+    let (addr, _handle, _) = start(ServerConfig::default()).await;
+    let mut ws = connect(addr).await;
+    // Past the first-request timeout, which only applies before the upgrade request.
+    tokio::time::sleep(Duration::from_secs(31)).await;
+    tokio::time::resume();
+    assert_eq!(
+        call(&mut ws, r#"{"jsonrpc":"2.0","id":1,"method":"eth_chainId"}"#).await,
+        r#"{"jsonrpc":"2.0","id":1,"result":"0x1"}"#
+    );
+}
