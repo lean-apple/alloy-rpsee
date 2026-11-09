@@ -109,7 +109,8 @@ impl<S: RpcServiceT + Send + Sync + 'static> WsConnection<S> {
         let reading = stop.child_token();
         // Cancelled once no call is left to answer, which lets the writer finish.
         let answered = CancellationToken::new();
-        let read = read_loop(stream, Arc::new(rpc_service), sender, &config, &reading, &answered);
+        let read =
+            read_loop(stream, Arc::new(rpc_service), sender, &config, &stop, &reading, &answered);
         let write = write_loop(sink, outgoing, config.ws_write_timeout, &answered, &reading);
         future::join(read, write).await;
         tracing::debug!(id = id.0, "WebSocket connection closed");
@@ -118,12 +119,14 @@ impl<S: RpcServiceT + Send + Sync + 'static> WsConnection<S> {
 }
 
 // Reads requests and runs each as its own call until `reading` is cancelled or the client
-// leaves, then waits for the running calls before cancelling `answered`.
+// leaves, then cancels `answered` once the running calls end. They finish when the server stops,
+// and are dropped otherwise, since no one is left to answer.
 async fn read_loop<St, S>(
     mut stream: St,
     rpc_service: Arc<S>,
     sender: mpsc::Sender<String>,
     config: &ServerConfig,
+    stop: &CancellationToken,
     reading: &CancellationToken,
     answered: &CancellationToken,
 ) where
@@ -134,6 +137,7 @@ async fn read_loop<St, S>(
     // Bounds the calls running at once, so a client sending faster than it reads waits.
     let slots = Arc::new(Semaphore::new(capacity));
     let calls = TaskTracker::new();
+    let disconnected = CancellationToken::new();
     while let Some(Some(message)) = reading.run_until_cancelled(stream.next()).await {
         let body = match message {
             Ok(Message::Text(text)) => Bytes::from(text),
@@ -157,15 +161,23 @@ async fn read_loop<St, S>(
         else {
             break;
         };
-        let (rpc_service, sender, batch_config) =
-            (rpc_service.clone(), sender.clone(), config.batch_requests_config);
+        let (rpc_service, sender, batch_config, disconnected) = (
+            rpc_service.clone(),
+            sender.clone(),
+            config.batch_requests_config,
+            disconnected.clone(),
+        );
         calls.spawn(async move {
-            if let Some(json) = answer(&body, batch_config, &*rpc_service).await {
+            let answer = answer(&body, batch_config, &*rpc_service);
+            if let Some(Some(json)) = disconnected.run_until_cancelled(answer).await {
                 // A failed send means the connection is closing, with no one left to answer.
                 let _ = sender.send(json).await;
             }
             drop(slot);
         });
+    }
+    if !stop.is_cancelled() {
+        disconnected.cancel();
     }
     calls.close();
     calls.wait().await;
