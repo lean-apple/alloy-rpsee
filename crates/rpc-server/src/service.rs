@@ -27,7 +27,7 @@
 //! Request dispatch shared by every transport.
 
 use crate::{
-    MethodResponse, Methods, Request,
+    CallContext, Connection, MethodResponse, Methods, Request,
     batch::{Batch, BatchEntry, BatchEntryErr, BatchResponseBuilder},
     error::BatchError,
 };
@@ -68,12 +68,25 @@ pub struct RpcService {
     methods: Methods,
     // The most bytes a response, or a batch's joined responses, may take.
     max_response_size: usize,
+    // The connection calls arrive on, which subscriptions need.
+    connection: Option<Connection>,
 }
 
 impl RpcService {
     /// Creates a service over `methods` whose responses are at most `max_response_size` bytes.
+    ///
+    /// Subscriptions need a connection, so their calls are answered with `-32603 Internal error`.
     pub fn new(methods: impl Into<Methods>, max_response_size: usize) -> Self {
-        Self { methods: methods.into(), max_response_size }
+        Self { methods: methods.into(), max_response_size, connection: None }
+    }
+
+    /// Same as [`Self::new`], for calls arriving on `connection`, which can carry subscriptions.
+    pub fn with_connection(
+        methods: impl Into<Methods>,
+        max_response_size: usize,
+        connection: Connection,
+    ) -> Self {
+        Self { methods: methods.into(), max_response_size, connection: Some(connection) }
     }
 }
 
@@ -81,7 +94,13 @@ impl RpcServiceT for RpcService {
     fn call<'a>(&self, request: Request<'a>) -> impl Future<Output = MethodResponse> + Send + 'a {
         let id = request.id.unwrap_or(Id::None);
         match self.methods.method(&request.method) {
-            Some(method) => Either::Left(method.call(id, request.params, self.max_response_size)),
+            Some(method) => {
+                let context = CallContext {
+                    max_response_size: self.max_response_size,
+                    connection: self.connection.as_ref(),
+                };
+                Either::Left(method.call(id, request.params, &context))
+            }
             None => {
                 Either::Right(ready(MethodResponse::error(id, ErrorPayload::method_not_found())))
             }
@@ -92,23 +111,30 @@ impl RpcServiceT for RpcService {
         let service = self.clone();
         async move {
             let mut responses = BatchResponseBuilder::new(service.max_response_size);
-            let mut got_notification = false;
+            // Set when an entry needs no answer in the array, so a batch of only those sends
+            // nothing.
+            let mut answered_elsewhere = false;
             // Entries run one after another, so a batch takes one call at a time.
             for entry in batch {
                 let response = match entry {
                     Ok(BatchEntry::Call(request)) => call_guarded(&service, request).await,
                     Ok(BatchEntry::Notification(request)) => {
-                        got_notification = true;
+                        answered_elsewhere = true;
                         service.notification(request).await;
                         continue;
                     }
                     Err(err) => err.into(),
                 };
+                // An accepted subscription already sent its answer.
+                if response.is_subscription() {
+                    answered_elsewhere = true;
+                    continue;
+                }
                 if let Err(too_big) = responses.append(response) {
                     return too_big;
                 }
             }
-            if responses.is_empty() && got_notification {
+            if responses.is_empty() && answered_elsewhere {
                 MethodResponse::notification()
             } else {
                 responses.finish()
@@ -140,8 +166,9 @@ pub enum BatchRequestConfig {
 /// Answers `body`, a single message if `is_single` or else a batch, through `rpc_service`.
 ///
 /// The transport picks `is_single` and limits the body size. It sends the response unless it
-/// [is a notification](MethodResponse::is_notification). A call that panics is answered with
-/// `-32603 Internal error`.
+/// [is a notification](MethodResponse::is_notification) or
+/// [a subscription](MethodResponse::is_subscription), which already answered on its connection. A
+/// call that panics is answered with `-32603 Internal error`.
 ///
 /// # Examples
 ///

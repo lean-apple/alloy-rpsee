@@ -1,7 +1,11 @@
 //! Typed method registration.
 
 use crate::{
-    MethodResponse, Methods, error::RegisterMethodError, methods::MethodCallback, parse_params,
+    MethodResponse, Methods, PendingSubscriptionSink, SubscriptionId, SubscriptionResult,
+    error::{RegisterMethodError, TooManySubscriptions},
+    methods::MethodCallback,
+    parse_params,
+    subscription::SinkInner,
 };
 use alloy_json_rpc::{ErrorPayload, Id};
 use futures_util::future::Either;
@@ -9,8 +13,13 @@ use serde::{Serialize, de::DeserializeOwned};
 use std::{
     future::{Future, ready},
     ops::{Deref, DerefMut},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
+use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 
 /// Methods that share a context, such as one RPC namespace.
 ///
@@ -79,9 +88,9 @@ impl<Context: Send + Sync + 'static> RpcModule<Context> {
         F: Fn(P, &Context) -> Result<R, E> + Send + Sync + 'static,
     {
         let ctx = self.ctx.clone();
-        let method = MethodCallback::new(move |id, params, max_response_size| {
+        let method = MethodCallback::new(move |id, params, context| {
             let response = match parse_params::<P>(params) {
-                Ok(params) => respond(id, callback(params, &ctx), max_response_size),
+                Ok(params) => respond(id, callback(params, &ctx), context.max_response_size),
                 Err(err) => MethodResponse::error(id, err),
             };
             Either::Left(ready(response))
@@ -110,17 +119,17 @@ impl<Context: Send + Sync + 'static> RpcModule<Context> {
         Fut: Future<Output = Result<R, E>> + Send + 'static,
     {
         let ctx = self.ctx.clone();
-        let method = MethodCallback::new(move |id, params, max_response_size| {
-            match parse_params::<P>(params) {
+        let method =
+            MethodCallback::new(move |id, params, context| match parse_params::<P>(params) {
                 Ok(params) => {
                     let call = callback(params, ctx.clone());
+                    let max_response_size = context.max_response_size;
                     Either::Right(Box::pin(
                         async move { respond(id, call.await, max_response_size) },
                     ))
                 }
                 Err(err) => Either::Left(ready(MethodResponse::error(id, err))),
-            }
-        });
+            });
         self.methods.verify_and_insert(method_name, method)
     }
 
@@ -146,12 +155,13 @@ impl<Context: Send + Sync + 'static> RpcModule<Context> {
     {
         let ctx = self.ctx.clone();
         let callback = Arc::new(callback);
-        let method = MethodCallback::new(move |id, params, max_response_size| {
+        let method = MethodCallback::new(move |id, params, context| {
             let params = match parse_params::<P>(params) {
                 Ok(params) => params,
                 Err(err) => return Either::Left(ready(MethodResponse::error(id, err))),
             };
             let (ctx, callback, error_id) = (ctx.clone(), callback.clone(), id.clone());
+            let max_response_size = context.max_response_size;
             let call = tokio::task::spawn_blocking(move || {
                 respond(id, callback(params, ctx), max_response_size)
             });
@@ -168,6 +178,94 @@ impl<Context: Send + Sync + 'static> RpcModule<Context> {
             }))
         });
         self.methods.verify_and_insert(method_name, method)
+    }
+
+    /// Registers a subscription, which `subscribe` starts and `unsubscribe` ends, sending its
+    /// notifications as `notification`.
+    ///
+    /// `callback` runs on its own task and answers the call with the [`PendingSubscriptionSink`].
+    /// An error it returns once accepted is sent to the client as a last notification.
+    /// Subscriptions need a connection, so over HTTP the call is answered with `-32603 Internal
+    /// error`, and past the connection's limit with `-32006`. `unsubscribe` answers `true` if it
+    /// ended an active subscription of the connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegisterMethodError::AlreadyRegistered`] if `subscribe` or `unsubscribe` is taken.
+    pub fn register_subscription<P, F, Fut>(
+        &mut self,
+        subscribe: &'static str,
+        notification: &'static str,
+        unsubscribe: &'static str,
+        callback: F,
+    ) -> Result<&mut MethodCallback, RegisterMethodError>
+    where
+        P: DeserializeOwned,
+        F: Fn(P, PendingSubscriptionSink, Arc<Context>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = SubscriptionResult> + Send + 'static,
+    {
+        // Checked first so a taken `subscribe` doesn't leave `unsubscribe` registered.
+        if self.method(subscribe).is_some() {
+            return Err(RegisterMethodError::AlreadyRegistered(subscribe));
+        }
+        let unsubscribe_method = MethodCallback::new(move |id, params, context| {
+            let Some(connection) = context.connection else {
+                return Either::Left(ready(no_connection(id, unsubscribe)));
+            };
+            // An id that doesn't decode matches no subscription.
+            let ended = parse_params::<(SubscriptionId,)>(params)
+                .is_ok_and(|(subscription,)| connection.unsubscribe(subscribe, subscription));
+            Either::Left(ready(MethodResponse::success(id, &ended, context.max_response_size)))
+        });
+        self.methods.verify_and_insert(unsubscribe, unsubscribe_method)?;
+
+        let ctx = self.ctx.clone();
+        let subscribe_method = MethodCallback::new(move |id, params, context| {
+            let Some(connection) = context.connection else {
+                return Either::Left(ready(no_connection(id, subscribe)));
+            };
+            let params = match parse_params::<P>(params) {
+                Ok(params) => params,
+                Err(err) => return Either::Left(ready(MethodResponse::error(id, err))),
+            };
+            let Some(permit) = connection.try_acquire() else {
+                let err = TooManySubscriptions { limit: connection.max_subscriptions() };
+                return Either::Left(ready(MethodResponse::error(id, err)));
+            };
+            let subscription_id = connection.next_id();
+            let (answer, answered) = oneshot::channel();
+            let accepted = Arc::new(AtomicBool::new(false));
+            let pending = PendingSubscriptionSink {
+                id: id.clone(),
+                sink: SinkInner {
+                    subscribe,
+                    method: notification,
+                    subscription_id: subscription_id.clone(),
+                    connection: connection.clone(),
+                    unsubscribed: CancellationToken::new(),
+                    max_response_size: context.max_response_size,
+                    _permit: permit,
+                },
+                answer,
+                accepted: accepted.clone(),
+            };
+            let subscription = callback(params, pending, ctx.clone());
+            let connection = connection.clone();
+            tokio::spawn(async move {
+                if let Err(err) = subscription.await
+                    && accepted.load(Ordering::Acquire)
+                {
+                    connection.send_error(notification, &subscription_id, err).await;
+                }
+            });
+            // A subscription that drops its pending sink, or panics, never answers.
+            Either::Right(Box::pin(async move {
+                answered
+                    .await
+                    .unwrap_or_else(|_| MethodResponse::error(id, ErrorPayload::internal_error()))
+            }))
+        });
+        self.methods.verify_and_insert(subscribe, subscribe_method)
     }
 
     /// Registers `alias` as another name for the method `existing`.
@@ -208,6 +306,13 @@ impl<Context> From<RpcModule<Context>> for Methods {
     }
 }
 
+// The answer to a subscription call over a transport without connections.
+fn no_connection(id: Id, method: &str) -> MethodResponse {
+    // Clients choose the transport, so this is theirs to fix.
+    tracing::debug!(method, "subscriptions need a connection, such as a WebSocket");
+    MethodResponse::error(id, ErrorPayload::internal_error())
+}
+
 // The response to a method's result.
 fn respond<R: Serialize, E: Into<ErrorPayload>>(
     id: Id,
@@ -223,6 +328,7 @@ fn respond<R: Serialize, E: Into<ErrorPayload>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::CallContext;
     use serde_json::value::RawValue;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -284,7 +390,11 @@ mod tests {
     #[tokio::test]
     async fn response_is_bounded() {
         let raw = RawValue::from_string("[2]".to_owned()).unwrap();
-        let response = module().method("double").unwrap().call(Id::Number(1), Some(&raw), 16);
+        let response = module().method("double").unwrap().call(
+            Id::Number(1),
+            Some(&raw),
+            &CallContext::new(16),
+        );
         assert_eq!(
             response.await.into_json(),
             r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32008,"message":"Response is too big","data":"Exceeded max limit of 16"}}"#

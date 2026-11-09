@@ -27,7 +27,8 @@
 //! The method table calls are dispatched to.
 
 use crate::{
-    BatchRequestConfig, MethodResponse, RpcService, error::RegisterMethodError, handle_rpc_call,
+    BatchRequestConfig, Connection, MethodResponse, RpcService, error::RegisterMethodError,
+    handle_rpc_call,
 };
 use alloy_json_rpc::Id;
 use alloy_primitives::map::{Entry, HashMap};
@@ -38,8 +39,8 @@ use std::{fmt, future::Ready, sync::Arc};
 /// The future of a method call. A synchronous method's response is ready without an allocation.
 pub type ResponseFuture = Either<Ready<MethodResponse>, BoxFuture<'static, MethodResponse>>;
 
-// A method body: takes the call's id, raw params and response size limit.
-type Callback = dyn Fn(Id, Option<&RawValue>, usize) -> ResponseFuture + Send + Sync;
+// A method body: takes the call's id, raw params and context.
+type Callback = dyn Fn(Id, Option<&RawValue>, &CallContext<'_>) -> ResponseFuture + Send + Sync;
 
 /// A table of methods by name.
 ///
@@ -122,21 +123,41 @@ pub struct MethodCallback(Arc<Callback>);
 impl MethodCallback {
     /// Wraps a method body.
     pub(crate) fn new(
-        callback: impl Fn(Id, Option<&RawValue>, usize) -> ResponseFuture + Send + Sync + 'static,
+        callback: impl Fn(Id, Option<&RawValue>, &CallContext<'_>) -> ResponseFuture
+        + Send
+        + Sync
+        + 'static,
     ) -> Self {
         Self(Arc::new(callback))
     }
 
     /// Calls the method with the call's `id` and raw `params`.
     ///
-    /// The response is at most `max_response_size` bytes, or `-32008 Response is too big`.
+    /// The response is at most `context.max_response_size` bytes, or `-32008 Response is too
+    /// big`.
     pub fn call(
         &self,
         id: Id,
         params: Option<&RawValue>,
-        max_response_size: usize,
+        context: &CallContext<'_>,
     ) -> ResponseFuture {
-        (self.0)(id, params, max_response_size)
+        (self.0)(id, params, context)
+    }
+}
+
+/// What a call needs from the transport it arrives on.
+#[derive(Debug, Clone, Copy)]
+pub struct CallContext<'a> {
+    /// The most bytes the response may take.
+    pub max_response_size: usize,
+    /// The connection the call arrives on, which subscriptions need. `None` over HTTP.
+    pub connection: Option<&'a Connection>,
+}
+
+impl CallContext<'_> {
+    /// A call without a connection, whose response takes at most `max_response_size` bytes.
+    pub const fn new(max_response_size: usize) -> Self {
+        Self { max_response_size, connection: None }
     }
 }
 
@@ -153,8 +174,8 @@ mod tests {
     use test_case::test_case;
 
     fn ok() -> MethodCallback {
-        MethodCallback::new(|id, _, max_response_size| {
-            Either::Left(ready(MethodResponse::success(id, "ok", max_response_size)))
+        MethodCallback::new(|id, _, context| {
+            Either::Left(ready(MethodResponse::success(id, "ok", context.max_response_size)))
         })
     }
 
