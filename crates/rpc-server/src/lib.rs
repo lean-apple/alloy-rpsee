@@ -2,6 +2,9 @@
 
 pub use alloy_json_rpc::{ErrorPayload, Id};
 
+mod batch;
+pub use batch::{Batch, BatchEntry, BatchEntryErr};
+
 mod error;
 pub use error::{InvalidParams, RegisterMethodError};
 
@@ -19,5 +22,8 @@ pub use response::MethodResponse;
 
 mod rpc_module;
 pub use rpc_module::RpcModule;
+
+mod service;
+pub use service::{BatchRequestConfig, RpcService, RpcServiceT, handle_rpc_call};
 
 mod writer;

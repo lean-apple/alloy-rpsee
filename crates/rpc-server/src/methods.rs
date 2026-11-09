@@ -26,11 +26,12 @@
 
 //! The method table calls are dispatched to.
 
-use crate::{MethodResponse, Request, error::RegisterMethodError};
-use alloy_json_rpc::{ErrorPayload, Id};
+use crate::{
+    BatchRequestConfig, MethodResponse, RpcService, error::RegisterMethodError, handle_rpc_call,
+};
+use alloy_json_rpc::Id;
 use alloy_primitives::map::{Entry, HashMap};
 use futures_util::future::{BoxFuture, Either};
-use serde::de::IgnoredAny;
 use serde_json::value::RawValue;
 use std::{fmt, future::Ready, sync::Arc};
 
@@ -101,20 +102,16 @@ impl Methods {
         self.callbacks.keys().copied()
     }
 
-    /// Answers one JSON-RPC request in process, with no response size limit.
+    /// Answers a JSON-RPC message, a single request or a batch, in process with no response size
+    /// limit.
     ///
     /// Returns an empty string for a notification, which gets no answer. Meant for tests.
     pub async fn raw_json_request(&self, request: &str) -> String {
-        let Ok(request) = serde_json::from_str::<Request<'_>>(request) else {
-            return invalid_request(request).into_json();
-        };
-        let is_notification = request.id.is_none();
-        let id = request.id.unwrap_or(Id::None);
-        let response = match self.method(&request.method) {
-            Some(method) => method.call(id, request.params, usize::MAX).await,
-            None => MethodResponse::error(id, ErrorPayload::method_not_found()),
-        };
-        if is_notification { String::new() } else { response.into_json() }
+        let service = RpcService::new(self.clone(), usize::MAX);
+        let is_single = !request.trim_start().starts_with('[');
+        handle_rpc_call(request.as_bytes(), is_single, BatchRequestConfig::Unlimited, &service)
+            .await
+            .into_json()
     }
 }
 
@@ -147,15 +144,6 @@ impl fmt::Debug for MethodCallback {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MethodCallback").finish_non_exhaustive()
     }
-}
-
-// `-32700 Parse error` for a body that isn't JSON, otherwise `-32600 Invalid request`.
-fn invalid_request(body: &str) -> MethodResponse {
-    let err = match serde_json::from_str::<IgnoredAny>(body) {
-        Ok(_) => ErrorPayload::invalid_request(),
-        Err(_) => ErrorPayload::parse_error(),
-    };
-    MethodResponse::error(Id::None, err)
 }
 
 #[cfg(test)]
@@ -221,7 +209,8 @@ mod tests {
     #[test_case(r#"{"jsonrpc":"2.0","method":"a"}"#, "" ; "notification")]
     #[test_case(r#"{"jsonrpc":"2.0","id":1,"method":"b"}"#, r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}"# ; "unknown method")]
     #[test_case(r#"{"jsonrpc":"2.0","id":1"#, r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}"# ; "not json")]
-    #[test_case(r#"{"id":1,"method":"a"}"#, r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid Request"}}"# ; "not a request")]
+    #[test_case(r#"{"id":1,"method":"a"}"#, r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"Invalid Request"}}"# ; "not a request")]
+    #[test_case(r#"[{"jsonrpc":"2.0","id":1,"method":"a"}]"#, r#"[{"jsonrpc":"2.0","id":1,"result":"ok"}]"# ; "batch")]
     #[tokio::test]
     async fn raw_json_request(request: &str, response: &str) {
         assert_eq!(methods(&["a"]).raw_json_request(request).await, response);
