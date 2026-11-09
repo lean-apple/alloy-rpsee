@@ -10,7 +10,8 @@ use quote::{format_ident, quote};
 use std::collections::HashSet;
 use syn::{
     Attribute, FnArg, Ident, ItemTrait, LitStr, ReturnType, Signature, TraitItem, TraitItemFn,
-    Type, parse_macro_input, parse_quote, punctuated::Punctuated, spanned::Spanned, visit::Visit,
+    Type, meta::ParseNestedMeta, parse_macro_input, parse_quote, punctuated::Punctuated,
+    spanned::Spanned, visit::Visit,
 };
 
 /// Generates `<Trait>Server` and its `into_rpc` from an RPC trait.
@@ -244,9 +245,19 @@ impl RpcMethod {
             })?;
         let attr = method.attrs.remove(position);
         let (name, kind) = if attr.path().is_ident("method") {
-            parse_method(&attr, &method.sig)?
+            let MethodAttr { name, aliases, blocking } = MethodAttr::parse(&attr)?;
+            if blocking && method.sig.asyncness.is_some() {
+                let message = "`blocking` methods can't be `async`";
+                return Err(syn::Error::new(method.sig.span(), message));
+            }
+            (name, Kind::Method { aliases, blocking })
         } else {
-            parse_subscription(&attr, &method.sig)?
+            let SubscriptionAttr { name, notification, unsubscribe, item } =
+                SubscriptionAttr::parse(&attr)?;
+            if method.sig.asyncness.is_none() {
+                return Err(syn::Error::new(method.sig.span(), "subscriptions must be `async`"));
+            }
+            (name, Kind::Subscription { notification, unsubscribe, item })
         };
 
         let mut inputs = method.sig.inputs.iter();
@@ -414,60 +425,90 @@ impl RpcMethod {
     }
 }
 
-// Reads `#[method(name = "..", aliases = [".."], blocking)]`.
-fn parse_method(attr: &Attribute, sig: &Signature) -> syn::Result<(String, Kind)> {
-    let (mut name, mut aliases, mut blocking) = (None, Vec::new(), false);
-    attr.parse_nested_meta(|meta| {
-        if meta.path.is_ident("name") {
-            name = Some(meta.value()?.parse::<LitStr>()?.value());
-        } else if meta.path.is_ident("aliases") {
-            let value = meta.value()?;
-            let content;
-            syn::bracketed!(content in value);
-            let list = Punctuated::<LitStr, syn::Token![,]>::parse_terminated(&content)?;
-            aliases = list.iter().map(LitStr::value).collect();
-        } else if meta.path.is_ident("blocking") {
-            blocking = true;
-        } else {
-            return Err(meta.error("expected `name`, `aliases` or `blocking`"));
-        }
-        Ok(())
-    })?;
-    let name = name.ok_or_else(|| syn::Error::new(attr.meta.span(), "missing `name = \"..\"`"))?;
-    if blocking && sig.asyncness.is_some() {
-        return Err(syn::Error::new(sig.span(), "`blocking` methods can't be `async`"));
-    }
-    Ok((name, Kind::Method { aliases, blocking }))
+// The arguments of `#[method(name = "..", aliases = [".."], blocking)]`.
+struct MethodAttr {
+    // The name without the namespace.
+    name: String,
+    // Extra names, registered as written.
+    aliases: Vec<String>,
+    // Whether the method runs on the blocking pool.
+    blocking: bool,
 }
 
-// Reads `#[subscription(name = ".." => "..", unsubscribe = "..", item = T)]`, where `=> ".."`
-// names the notifications.
-fn parse_subscription(attr: &Attribute, sig: &Signature) -> syn::Result<(String, Kind)> {
-    let (mut name, mut notification, mut unsubscribe, mut item) = (None, None, None, None);
-    attr.parse_nested_meta(|meta| {
-        if meta.path.is_ident("name") {
-            let value = meta.value()?;
-            name = Some(value.parse::<LitStr>()?.value());
-            if value.parse::<Option<syn::Token![=>]>>()?.is_some() {
-                notification = Some(value.parse::<LitStr>()?.value());
+impl MethodAttr {
+    // Reads the attribute's arguments.
+    fn parse(attr: &Attribute) -> syn::Result<Self> {
+        let (mut name, mut aliases, mut blocking) = (None, Vec::new(), false);
+        attr.parse_nested_meta(|meta| {
+            match meta.path.get_ident().map(Ident::to_string).as_deref() {
+                Some("name") => name = Some(string(&meta)?),
+                Some("aliases") => aliases = strings(&meta)?,
+                Some("blocking") => blocking = true,
+                _ => return Err(meta.error("expected `name`, `aliases` or `blocking`")),
             }
-        } else if meta.path.is_ident("unsubscribe") {
-            unsubscribe = Some(meta.value()?.parse::<LitStr>()?.value());
-        } else if meta.path.is_ident("item") {
-            item = Some(meta.value()?.parse::<Type>()?);
-        } else {
-            return Err(meta.error("expected `name`, `unsubscribe` or `item`"));
-        }
-        Ok(())
-    })?;
-    let missing = |field| syn::Error::new(attr.meta.span(), format!("missing `{field}`"));
-    let name = name.ok_or_else(|| missing("name = \"..\""))?;
-    let unsubscribe = unsubscribe.ok_or_else(|| missing("unsubscribe = \"..\""))?;
-    let item = Box::new(item.ok_or_else(|| missing("item = .."))?);
-    if sig.asyncness.is_none() {
-        return Err(syn::Error::new(sig.span(), "subscriptions must be `async`"));
+            Ok(())
+        })?;
+        Ok(Self { name: required(attr, name, "name = \"..\"")?, aliases, blocking })
     }
-    Ok((name, Kind::Subscription { notification, unsubscribe, item }))
+}
+
+// The arguments of `#[subscription(name = ".." => "..", unsubscribe = "..", item = T)]`, where
+// `=> ".."` names the notifications.
+struct SubscriptionAttr {
+    // The name without the namespace.
+    name: String,
+    // The notification method name without the namespace, if it differs.
+    notification: Option<String>,
+    // The unsubscribe method name without the namespace.
+    unsubscribe: String,
+    // The type each notification carries.
+    item: Box<Type>,
+}
+
+impl SubscriptionAttr {
+    // Reads the attribute's arguments.
+    fn parse(attr: &Attribute) -> syn::Result<Self> {
+        let (mut name, mut notification, mut unsubscribe, mut item) = (None, None, None, None);
+        attr.parse_nested_meta(|meta| {
+            match meta.path.get_ident().map(Ident::to_string).as_deref() {
+                Some("name") => {
+                    name = Some(string(&meta)?);
+                    if meta.input.parse::<Option<syn::Token![=>]>>()?.is_some() {
+                        notification = Some(meta.input.parse::<LitStr>()?.value());
+                    }
+                }
+                Some("unsubscribe") => unsubscribe = Some(string(&meta)?),
+                Some("item") => item = Some(Box::new(meta.value()?.parse::<Type>()?)),
+                _ => return Err(meta.error("expected `name`, `unsubscribe` or `item`")),
+            }
+            Ok(())
+        })?;
+        Ok(Self {
+            name: required(attr, name, "name = \"..\"")?,
+            notification,
+            unsubscribe: required(attr, unsubscribe, "unsubscribe = \"..\"")?,
+            item: required(attr, item, "item = ..")?,
+        })
+    }
+}
+
+// The string of `key = ".."`.
+fn string(meta: &ParseNestedMeta<'_>) -> syn::Result<String> {
+    Ok(meta.value()?.parse::<LitStr>()?.value())
+}
+
+// The strings of `key = ["..", ".."]`.
+fn strings(meta: &ParseNestedMeta<'_>) -> syn::Result<Vec<String>> {
+    let value = meta.value()?;
+    let content;
+    syn::bracketed!(content in value);
+    let list = Punctuated::<LitStr, syn::Token![,]>::parse_terminated(&content)?;
+    Ok(list.iter().map(LitStr::value).collect())
+}
+
+// The value of a required `key`, or an error pointing at the attribute.
+fn required<T>(attr: &Attribute, value: Option<T>, key: &str) -> syn::Result<T> {
+    value.ok_or_else(|| syn::Error::new(attr.meta.span(), format!("missing `{key}`")))
 }
 
 // The idents of the trait's type parameters.
