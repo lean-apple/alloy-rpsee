@@ -44,6 +44,9 @@ impl ServerHandle {
 
     /// Stops accepting connections and lets the open ones finish their requests.
     ///
+    /// WebSocket calls have 30 seconds to finish before their futures are dropped. Already running
+    /// blocking callbacks continue on their pool.
+    ///
     /// # Errors
     ///
     /// Returns [`AlreadyStoppedError`] if the server was already stopped.

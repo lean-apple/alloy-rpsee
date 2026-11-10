@@ -8,7 +8,7 @@ use futures_util::{SinkExt, StreamExt};
 use http_body_util::{BodyExt, Full};
 use hyper::{Request, StatusCode, header};
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
-use std::{net::SocketAddr, time::Duration};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{net::TcpStream, sync::mpsc};
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async,
@@ -17,8 +17,20 @@ use tokio_tungstenite::{
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-// A module with `eth_chainId`, a `slow` method, a `ticks` subscription sending 1 then 2, and a
-// `flood` subscription sending large items until it ends, reporting its end on `ended`.
+// Reports on its channel when dropped, unless the test already ended.
+struct OnDrop(Arc<mpsc::Sender<()>>);
+
+impl Drop for OnDrop {
+    fn drop(&mut self) {
+        if let Err(mpsc::error::TrySendError::Full(())) = self.0.try_send(()) {
+            panic!("the drop report found the channel full");
+        }
+    }
+}
+
+// A module with `eth_chainId`, a `slow` method, a `hang` method that never answers and reports its
+// start and its drop on `ended`, a `ticks` subscription sending 1 then 2, and a `flood`
+// subscription sending large items until it ends, reporting its end on `ended`.
 fn module(ended: mpsc::Sender<()>) -> RpcModule<mpsc::Sender<()>> {
     let mut module = RpcModule::new(ended);
     module.register_method("eth_chainId", |(): (), _| Ok::<_, ErrorPayload>("0x1")).unwrap();
@@ -26,6 +38,13 @@ fn module(ended: mpsc::Sender<()>) -> RpcModule<mpsc::Sender<()>> {
         .register_async_method("slow", |(): (), _| async {
             tokio::time::sleep(Duration::from_millis(200)).await;
             Ok::<_, ErrorPayload>("done")
+        })
+        .unwrap();
+    module
+        .register_async_method("hang", |(): (), ended: Arc<mpsc::Sender<()>>| async move {
+            ended.send(()).await.unwrap();
+            let _dropped = OnDrop(ended);
+            std::future::pending::<Result<(), ErrorPayload>>().await
         })
         .unwrap();
     module
@@ -223,4 +242,17 @@ async fn idle_connection_stays_open_after_its_first_request() {
         call(&mut ws, r#"{"jsonrpc":"2.0","id":1,"method":"eth_chainId"}"#).await,
         r#"{"jsonrpc":"2.0","id":1,"result":"0x1"}"#
     );
+}
+
+#[tokio::test]
+async fn disconnect_cancels_running_calls() {
+    let (addr, handle, mut ended) = start(ServerConfig::default()).await;
+    let mut ws = connect(addr).await;
+    ws.send(Message::text(r#"{"jsonrpc":"2.0","id":1,"method":"hang"}"#)).await.unwrap();
+    ended.recv().await.unwrap();
+    ws.close(None).await.unwrap();
+    let dropped = tokio::time::timeout(Duration::from_secs(5), ended.recv()).await;
+    assert!(dropped.expect("the call kept running").is_some());
+    handle.stop().unwrap();
+    tokio::time::timeout(Duration::from_secs(5), handle.stopped()).await.unwrap();
 }

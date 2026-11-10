@@ -29,7 +29,9 @@
 //! The connection reads requests and runs each as its own call, at most
 //! `message_buffer_capacity` at once, while a writer sends answers and subscription
 //! notifications from the connection's bounded queue. A write that takes longer than the write
-//! timeout closes the connection, so a client that stops reading can't hold its messages.
+//! timeout closes the connection, so a client that stops reading can't hold its messages. On
+//! shutdown, running calls have 30 seconds to finish before their futures are dropped. Already
+//! running blocking callbacks continue on their pool.
 
 use super::{
     ServerConfig,
@@ -56,6 +58,9 @@ use tokio_tungstenite::{
     },
 };
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
+
+// Bounds the grace period for calls after the connection stops accepting requests.
+const CALL_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 // A WebSocket connection, before and after hyper hands over its socket.
 pub(crate) struct WsConnection<S> {
@@ -109,7 +114,8 @@ impl<S: RpcServiceT + Send + Sync + 'static> WsConnection<S> {
         let reading = stop.child_token();
         // Cancelled once no call is left to answer, which lets the writer finish.
         let answered = CancellationToken::new();
-        let read = read_loop(stream, Arc::new(rpc_service), sender, &config, &reading, &answered);
+        let read =
+            read_loop(stream, Arc::new(rpc_service), sender, &config, &stop, &reading, &answered);
         let write = write_loop(sink, outgoing, config.ws_write_timeout, &answered, &reading);
         future::join(read, write).await;
         tracing::debug!(id = id.0, "WebSocket connection closed");
@@ -118,12 +124,14 @@ impl<S: RpcServiceT + Send + Sync + 'static> WsConnection<S> {
 }
 
 // Reads requests and runs each as its own call until `reading` is cancelled or the client
-// leaves, then waits for the running calls before cancelling `answered`.
+// leaves, then cancels `answered` once the running calls end. Shutdown gives calls a bounded
+// grace period, while disconnects drop them immediately, since no one is left to answer.
 async fn read_loop<St, S>(
     mut stream: St,
     rpc_service: Arc<S>,
     sender: mpsc::Sender<String>,
     config: &ServerConfig,
+    stop: &CancellationToken,
     reading: &CancellationToken,
     answered: &CancellationToken,
 ) where
@@ -134,6 +142,8 @@ async fn read_loop<St, S>(
     // Bounds the calls running at once, so a client sending faster than it reads waits.
     let slots = Arc::new(Semaphore::new(capacity));
     let calls = TaskTracker::new();
+    let disconnected = CancellationToken::new();
+    let _cancel_on_drop = disconnected.drop_guard_ref();
     while let Some(Some(message)) = reading.run_until_cancelled(stream.next()).await {
         let body = match message {
             Ok(Message::Text(text)) => Bytes::from(text),
@@ -159,16 +169,23 @@ async fn read_loop<St, S>(
         };
         let (rpc_service, sender, batch_config) =
             (rpc_service.clone(), sender.clone(), config.batch_requests_config);
-        calls.spawn(async move {
+        calls.spawn(disconnected.clone().run_until_cancelled_owned(async move {
             if let Some(json) = answer(&body, batch_config, &*rpc_service).await {
                 // A failed send means the connection is closing, with no one left to answer.
                 let _ = sender.send(json).await;
             }
             drop(slot);
-        });
+        }));
+    }
+    if !stop.is_cancelled() {
+        disconnected.cancel();
     }
     calls.close();
-    calls.wait().await;
+    if tokio::time::timeout(CALL_DRAIN_TIMEOUT, calls.wait()).await.is_err() {
+        tracing::debug!("WebSocket calls exceeded the drain deadline");
+        disconnected.cancel();
+        calls.wait().await;
+    }
     answered.cancel();
 }
 
@@ -240,4 +257,111 @@ pub fn is_upgrade_request(headers: &HeaderMap) -> bool {
     headers.get(header::UPGRADE).and_then(|value| value.to_str().ok()).is_some_and(|value| {
         value.split(',').any(|token| token.trim().eq_ignore_ascii_case("websocket"))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ErrorPayload, RpcModule, RpcService};
+    use futures_util::FutureExt;
+    use std::pin::pin;
+    use test_case::test_case;
+    use tokio::{sync::Notify, time::Instant};
+
+    #[test_case(false, false; "pending call is dropped")]
+    #[test_case(true, false; "running call finishes")]
+    #[test_case(true, true; "full response queue")]
+    #[tokio::test(start_paused = true)]
+    async fn call_drain_has_a_deadline(finish: bool, full_queue: bool) {
+        let started = Arc::new(Notify::new());
+        let complete = Arc::new(Notify::new());
+        let mut module = RpcModule::new((started.clone(), complete.clone()));
+        module
+            .register_async_method("wait", |(): (), context| async move {
+                context.0.notify_one();
+                context.1.notified().await;
+                Ok::<_, ErrorPayload>("done")
+            })
+            .unwrap();
+        let service = Arc::new(RpcService::new(module, 1024));
+        let stream = futures_util::stream::iter([Ok(Message::text(
+            r#"{"jsonrpc":"2.0","id":1,"method":"wait"}"#,
+        ))])
+        .chain(futures_util::stream::pending())
+        .boxed();
+        let (sender, mut outgoing) = mpsc::channel(1);
+        if full_queue {
+            sender.try_send("queued".to_owned()).unwrap();
+        }
+        let stop = CancellationToken::new();
+        let reading = stop.child_token();
+        let answered = CancellationToken::new();
+        let config = ServerConfig::default();
+        let before = Instant::now();
+        let read = read_loop(stream, service.clone(), sender, &config, &stop, &reading, &answered);
+        let shutdown = async {
+            started.notified().await;
+            stop.cancel();
+            if finish {
+                complete.notify_one();
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(31), future::join(read, shutdown)).await.unwrap();
+        assert!(answered.is_cancelled());
+        assert_eq!(Arc::strong_count(&service), 1);
+        if finish && !full_queue {
+            assert_eq!(before.elapsed(), Duration::ZERO);
+            assert_eq!(
+                outgoing.recv().await.unwrap(),
+                r#"{"jsonrpc":"2.0","id":1,"result":"done"}"#
+            );
+        } else {
+            assert_eq!(before.elapsed(), CALL_DRAIN_TIMEOUT);
+            if full_queue {
+                assert_eq!(outgoing.recv().await.as_deref(), Some("queued"));
+            }
+            assert_eq!(outgoing.recv().await, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_reader_cancels_pending_calls() {
+        let started = Arc::new(Notify::new());
+        let mut module = RpcModule::new(started.clone());
+        module
+            .register_async_method("wait", |(): (), started| async move {
+                started.notify_one();
+                future::pending::<Result<(), ErrorPayload>>().await
+            })
+            .unwrap();
+        let service = Arc::new(RpcService::new(module, 1024));
+        let stream = futures_util::stream::iter([Ok(Message::text(
+            r#"{"jsonrpc":"2.0","id":1,"method":"wait"}"#,
+        ))])
+        .chain(futures_util::stream::pending())
+        .boxed();
+        let (sender, mut outgoing) = mpsc::channel(1);
+        let stop = CancellationToken::new();
+        let reading = stop.child_token();
+        let answered = CancellationToken::new();
+        let config = ServerConfig::default();
+        {
+            let mut read = pin!(read_loop(
+                stream,
+                service.clone(),
+                sender,
+                &config,
+                &stop,
+                &reading,
+                &answered
+            ));
+            assert!(read.as_mut().now_or_never().is_none());
+            started.notified().await;
+        }
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), outgoing.recv()).await.unwrap(),
+            None
+        );
+        assert_eq!(Arc::strong_count(&service), 1);
+    }
 }
