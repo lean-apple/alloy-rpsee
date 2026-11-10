@@ -3,7 +3,8 @@
 //! The WebSocket decoder ends a connection once a message passes its size limit.
 //! [`RequestSizeLimit`] sits between the socket and the decoder, discards such a message as it
 //! arrives and queues an error for the client, so the decoder never sees it and the connection
-//! carries on.
+//! carries on. A skipped frame is still held to the checks the decoder makes on the frames it
+//! reads.
 
 use crate::{MethodResponse, error::ErrorCode};
 use alloy_json_rpc::Id;
@@ -16,9 +17,12 @@ use tokio::{
     io::{AsyncBufRead, AsyncRead, AsyncWrite, BufReader, ReadBuf},
     sync::mpsc,
 };
-use tokio_tungstenite::tungstenite::protocol::frame::{
-    FrameHeader,
-    coding::{Data, OpCode},
+use tokio_tungstenite::tungstenite::{
+    error::ProtocolError,
+    protocol::frame::{
+        FrameHeader,
+        coding::{Data, OpCode},
+    },
 };
 
 // The most bytes a frame header takes.
@@ -58,8 +62,18 @@ pub(crate) struct RequestSizeLimit<Io> {
     filled: usize,
     // How many bytes of `header` are handed to the decoder.
     forwarded: usize,
-    // Whether the rest of a skipped message is still arriving.
-    skipping: bool,
+    // The message whose later frames are still arriving, if any.
+    unfinished: Unfinished,
+}
+
+// What became of a message whose later frames are still arriving.
+enum Unfinished {
+    // No message is unfinished.
+    Nothing,
+    // Its frames go to the decoder.
+    Forwarded,
+    // Its frames are skipped.
+    Skipped,
 }
 
 // What the next bytes of the socket are.
@@ -85,32 +99,55 @@ impl<Io: AsyncRead> RequestSizeLimit<Io> {
             header: [0; MAX_HEADER_SIZE],
             filled: 0,
             forwarded: 0,
-            skipping: false,
+            unfinished: Unfinished::Nothing,
         }
     }
 
     // Decides what to do with the frame whose header was just read.
-    fn route(&mut self) -> State {
+    //
+    // # Errors
+    //
+    // Returns the error the decoder would raise on a skipped frame, which it never reads.
+    fn route(&mut self) -> Result<State, ProtocolError> {
         let read = self.header.get(..self.filled).unwrap_or_default();
         let Ok(Some((header, len))) = FrameHeader::parse(&mut Cursor::new(read)) else {
             // The decoder rejects this header too, which ends the connection.
-            return State::Forward(u64::MAX);
+            return Ok(State::Forward(u64::MAX));
         };
-        let skip = match header.opcode {
-            OpCode::Data(Data::Text | Data::Binary) => len > self.max_size,
-            OpCode::Data(Data::Continue) => self.skipping,
+        let skip = match (header.opcode, &self.unfinished) {
+            (OpCode::Data(Data::Text | Data::Binary), Unfinished::Nothing) => len > self.max_size,
+            // The decoder rejects a message that starts inside the one it holds.
+            (OpCode::Data(Data::Text | Data::Binary), Unfinished::Forwarded) => false,
+            (OpCode::Data(data @ (Data::Text | Data::Binary)), Unfinished::Skipped) => {
+                return Err(ProtocolError::ExpectedFragment(data));
+            }
+            (OpCode::Data(Data::Continue), unfinished) => matches!(unfinished, Unfinished::Skipped),
             // Control frames belong to no message and may arrive in the middle of one.
-            OpCode::Control(_) | OpCode::Data(Data::Reserved(_)) => return State::Forward(len),
+            (OpCode::Control(_) | OpCode::Data(Data::Reserved(_)), _) => {
+                return Ok(State::Forward(len));
+            }
         };
-        if skip && !self.skipping {
-            tracing::debug!(len, max_size = self.max_size, "WebSocket message too large");
-            // A full queue drops the answer, as the client isn't reading.
-            if self.sender.try_send(self.too_big.clone()).is_err() {
-                tracing::debug!("no room to answer an oversized WebSocket message");
+        if skip {
+            if header.mask.is_none() {
+                return Err(ProtocolError::UnmaskedFrameFromClient);
+            }
+            if header.rsv1 || header.rsv2 || header.rsv3 {
+                return Err(ProtocolError::NonZeroReservedBits);
+            }
+            if matches!(self.unfinished, Unfinished::Nothing) {
+                tracing::debug!(len, max_size = self.max_size, "WebSocket message too large");
+                // A full queue drops the answer, as the client isn't reading.
+                if self.sender.try_send(self.too_big.clone()).is_err() {
+                    tracing::debug!("no room to answer an oversized WebSocket message");
+                }
             }
         }
-        self.skipping = skip && !header.is_final;
-        if skip { State::Discard(len) } else { State::Forward(len) }
+        self.unfinished = match (header.is_final, skip) {
+            (true, _) => Unfinished::Nothing,
+            (false, true) => Unfinished::Skipped,
+            (false, false) => Unfinished::Forwarded,
+        };
+        Ok(if skip { State::Discard(len) } else { State::Forward(len) })
     }
 
     // Starts over on the next frame.
@@ -137,7 +174,9 @@ impl<Io: AsyncRead + Unpin> AsyncRead for RequestSizeLimit<Io> {
                     let wanted = header_len(this.header.get(..this.filled).unwrap_or_default());
                     let missing = this.header.get_mut(this.filled..wanted).unwrap_or_default();
                     if missing.is_empty() {
-                        this.state = this.route();
+                        this.state = this
+                            .route()
+                            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
                         continue;
                     }
                     let mut missing = ReadBuf::new(missing);
@@ -269,6 +308,20 @@ mod tests {
         masked(Frame::message(vec![b'x'; len], OpCode::Data(Data::Continue), is_final))
     }
 
+    // A text message sent without a mask, which a client may not do.
+    fn unmasked(len: usize) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        Frame::message(vec![b'x'; len], OpCode::Data(Data::Text), true).format(&mut bytes).unwrap();
+        bytes
+    }
+
+    // A text message with a reserved bit set, which no extension here allows.
+    fn reserved(len: usize) -> Vec<u8> {
+        let mut frame = Frame::message(vec![b'x'; len], OpCode::Data(Data::Text), true);
+        frame.header_mut().rsv1 = true;
+        masked(frame)
+    }
+
     // A control frame.
     fn ping() -> Vec<u8> {
         masked(Frame::ping(vec![b'x'; 4]))
@@ -351,9 +404,11 @@ mod tests {
         assert_eq!(answers, [OVERSIZED_REQUEST_JSON, OVERSIZED_REQUEST_JSON]);
     }
 
+    #[test_case(continuation(65, true) ; "growing past the limit")]
+    #[test_case(text(65, true) ; "followed by a new message")]
     #[tokio::test]
-    async fn message_growing_past_the_limit_is_left_to_the_decoder() {
-        let sent = [text(40, false), continuation(65, true)];
+    async fn unfinished_message_is_left_to_the_decoder(second: Vec<u8>) {
+        let sent = [text(40, false), second];
         let (read, answers) = filtered(&sent, 7).await;
         assert_eq!(read, sent.concat());
         assert!(answers.is_empty());
@@ -385,5 +440,18 @@ mod tests {
         // Reading each header and payload on its own would take thousands.
         let reads = socket.io.get_ref().reads;
         assert!(reads < 20, "{reads} reads");
+    }
+
+    #[test_case(&[text(65, false), text(9, true)], ProtocolError::ExpectedFragment(Data::Text) ; "new message inside a skipped one")]
+    #[test_case(&[unmasked(65)], ProtocolError::UnmaskedFrameFromClient ; "unmasked")]
+    #[test_case(&[reserved(65)], ProtocolError::NonZeroReservedBits ; "reserved bit")]
+    #[tokio::test]
+    async fn invalid_skipped_frame_is_rejected(sent: &[Vec<u8>], expected: ProtocolError) {
+        let sent = sent.concat();
+        let (sender, _answers) = mpsc::channel(1);
+        let mut socket = RequestSizeLimit::new(sent.as_slice(), MAX_SIZE, sender);
+        let err = socket.read_to_end(&mut Vec::new()).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(err.get_ref().unwrap().downcast_ref(), Some(&expected));
     }
 }
