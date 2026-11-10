@@ -13,7 +13,7 @@ use std::{
     task::{Context, Poll, ready},
 };
 use tokio::{
-    io::{AsyncRead, AsyncWrite, ReadBuf},
+    io::{AsyncBufRead, AsyncRead, AsyncWrite, BufReader, ReadBuf},
     sync::mpsc,
 };
 use tokio_tungstenite::tungstenite::protocol::frame::{
@@ -23,9 +23,6 @@ use tokio_tungstenite::tungstenite::protocol::frame::{
 
 // The most bytes a frame header takes.
 const MAX_HEADER_SIZE: usize = 14;
-
-// The most bytes of a skipped message read at once.
-const DISCARD_CHUNK_SIZE: usize = 8 * 1024;
 
 // The bits of a header's second byte holding the payload length, or one of the two markers below.
 const LENGTH_BITS: u8 = 0x7f;
@@ -44,8 +41,9 @@ const LENGTH_IN_8_BYTES: u8 = 127;
 // A message that only passes the limit in a later frame is left to the decoder, which already
 // holds its first frames.
 pub(crate) struct RequestSizeLimit<Io> {
-    // The socket.
-    io: Io,
+    // The socket, read through a buffer so that reading a header apart from its payload costs no
+    // read of its own.
+    io: BufReader<Io>,
     // The longest payload a message's first frame may have, in bytes.
     max_size: u64,
     // The error queued for the client on each skipped message.
@@ -74,12 +72,12 @@ enum State {
     Discard(u64),
 }
 
-impl<Io> RequestSizeLimit<Io> {
+impl<Io: AsyncRead> RequestSizeLimit<Io> {
     // Wraps `io`, answering messages over `max_size` bytes on `sender`.
     pub(crate) fn new(io: Io, max_size: u32, sender: mpsc::Sender<String>) -> Self {
         let too_big = ErrorCode::OversizedRequest.exceeded(max_size);
         Self {
-            io,
+            io: BufReader::new(io),
             max_size: max_size.into(),
             too_big: MethodResponse::error(Id::None, too_big).into_json(),
             sender,
@@ -177,17 +175,13 @@ impl<Io: AsyncRead + Unpin> AsyncRead for RequestSizeLimit<Io> {
                         this.next_frame();
                         continue;
                     }
-                    let mut chunk = [0; DISCARD_CHUNK_SIZE];
-                    let fitting = usize::try_from(left).unwrap_or(usize::MAX);
-                    let chunk =
-                        chunk.get_mut(..fitting.min(DISCARD_CHUNK_SIZE)).unwrap_or_default();
-                    let mut discarded = ReadBuf::new(chunk);
-                    ready!(Pin::new(&mut this.io).poll_read(cx, &mut discarded))?;
-                    let read = discarded.filled().len();
-                    if read == 0 {
+                    let buffered = ready!(Pin::new(&mut this.io).poll_fill_buf(cx))?.len();
+                    if buffered == 0 {
                         // The socket closed.
                         return Poll::Ready(Ok(()));
                     }
+                    let read = usize::try_from(left).unwrap_or(usize::MAX).min(buffered);
+                    Pin::new(&mut this.io).consume(read);
                     this.state = State::Discard(left.saturating_sub(as_u64(read)));
                 }
             }
@@ -195,7 +189,7 @@ impl<Io: AsyncRead + Unpin> AsyncRead for RequestSizeLimit<Io> {
     }
 }
 
-impl<Io: AsyncWrite + Unpin> AsyncWrite for RequestSizeLimit<Io> {
+impl<Io: AsyncRead + AsyncWrite + Unpin> AsyncWrite for RequestSizeLimit<Io> {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -280,6 +274,23 @@ mod tests {
         masked(Frame::ping(vec![b'x'; 4]))
     }
 
+    // A socket holding `unread` that counts the reads made on it.
+    struct Counted<'a> {
+        unread: &'a [u8],
+        reads: usize,
+    }
+
+    impl AsyncRead for Counted<'_> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            self.reads += 1;
+            Pin::new(&mut self.unread).poll_read(cx, buf)
+        }
+    }
+
     // What the decoder reads of `sent` when the socket hands out `step` bytes at a time, and the
     // answers queued.
     async fn filtered(sent: &[Vec<u8>], step: usize) -> (Vec<u8>, Vec<String>) {
@@ -360,5 +371,19 @@ mod tests {
         assert_eq!(read, text(9, true));
         assert_eq!(answers.recv().await.as_deref(), Some("queued"));
         assert_eq!(answers.recv().await, None);
+    }
+
+    #[tokio::test]
+    async fn frames_are_read_from_the_socket_together() {
+        let sent = vec![text(64, true); 1000].concat();
+        let (sender, _answers) = mpsc::channel(1);
+        let counted = Counted { unread: &sent, reads: 0 };
+        let mut socket = RequestSizeLimit::new(counted, MAX_SIZE, sender);
+        let mut read = Vec::new();
+        socket.read_to_end(&mut read).await.unwrap();
+        assert_eq!(read, sent);
+        // Reading each header and payload on its own would take thousands.
+        let reads = socket.io.get_ref().reads;
+        assert!(reads < 20, "{reads} reads");
     }
 }
