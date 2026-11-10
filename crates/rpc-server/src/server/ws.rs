@@ -29,13 +29,16 @@
 //! The connection reads requests and runs each as its own call, at most
 //! `message_buffer_capacity` at once, while a writer sends answers and subscription
 //! notifications from the connection's bounded queue. A write that takes longer than the write
-//! timeout closes the connection, so a client that stops reading can't hold its messages. On
+//! timeout closes the connection, so a client that stops reading can't hold its messages. A
+//! message over the request size limit is answered with `-32007 Request is too big` and skipped,
+//! unless it only passes the limit in a later frame, which closes the connection. On
 //! shutdown, running calls have 30 seconds to finish before their futures are dropped. Already
 //! running blocking callbacks continue on their pool.
 
 use super::{
     ServerConfig,
     http::{self, HttpBody, HttpRequest, HttpResponse},
+    request_size_limit::RequestSizeLimit,
     split_message,
 };
 use crate::{
@@ -108,6 +111,8 @@ impl<S: RpcServiceT + Send + Sync + 'static> WsConnection<S> {
         let ws_config = WebSocketConfig::default()
             .max_message_size(Some(max_message_size))
             .max_frame_size(Some(max_message_size));
+        // Skips the messages the decoder would end the connection over.
+        let io = RequestSizeLimit::new(io, config.max_request_body_size, sender.clone());
         let ws = WebSocketStream::from_raw_socket(io, Role::Server, Some(ws_config)).await;
         let (sink, stream) = ws.split();
         // Cancelled when the server stops or the writer ends, which ends reading.
@@ -151,7 +156,8 @@ async fn read_loop<St, S>(
             Ok(Message::Close(_)) => break,
             // The stream answers pings itself.
             Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_)) => continue,
-            // The read stopped partway through the message, so the connection can't continue.
+            // The message passed the limit in a later frame, when the decoder already held its
+            // first ones and can't skip it, so the connection can't continue.
             Err(WsError::Capacity(err)) => {
                 tracing::debug!(%err, "WebSocket message too large");
                 let err = ErrorCode::OversizedRequest.exceeded(config.max_request_body_size);
