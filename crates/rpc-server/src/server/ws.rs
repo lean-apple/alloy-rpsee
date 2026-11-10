@@ -27,11 +27,11 @@
 //! Serving one WebSocket connection.
 //!
 //! The connection reads requests and runs each as its own call, at most
-//! `message_buffer_capacity` at once, answering more with `-32009 Server is busy`, while a writer
-//! sends answers and subscription notifications from the connection's bounded queue. A write that
-//! takes longer than the write timeout closes the connection, so a client that stops reading can't
-//! hold its messages. On shutdown, running calls have 30 seconds to finish before their futures
-//! are dropped. Already running blocking callbacks continue on their pool.
+//! `message_buffer_capacity` at once, while a writer sends answers and subscription
+//! notifications from the connection's bounded queue. A write that takes longer than the write
+//! timeout closes the connection, so a client that stops reading can't hold its messages. On
+//! shutdown, running calls have 30 seconds to finish before their futures are dropped. Already
+//! running blocking callbacks continue on their pool.
 
 use super::{
     ServerConfig,
@@ -39,15 +39,14 @@ use super::{
     split_message,
 };
 use crate::{
-    BatchRequestConfig, ConnectionId, MethodResponse, Request, RpcServiceT,
-    batch::BatchResponseBuilder, error::ErrorCode, handle_rpc_call,
+    BatchRequestConfig, ConnectionId, MethodResponse, RpcServiceT, error::ErrorCode,
+    handle_rpc_call,
 };
 use alloy_json_rpc::Id;
 use bytes::Bytes;
 use futures_util::{Sink, SinkExt, Stream, StreamExt, future};
 use hyper::{HeaderMap, StatusCode, header, upgrade::Upgraded};
 use hyper_util::rt::TokioIo;
-use serde_json::value::RawValue;
 use std::{sync::Arc, time::Duration};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_tungstenite::{
@@ -140,7 +139,6 @@ async fn read_loop<St, S>(
     S: RpcServiceT + Send + Sync + 'static,
 {
     let capacity = usize::try_from(config.message_buffer_capacity).unwrap_or(usize::MAX);
-    let max_response_size = usize::try_from(config.max_response_body_size).unwrap_or(usize::MAX);
     // Bounds the calls running at once, so a client sending faster than it reads waits.
     let slots = Arc::new(Semaphore::new(capacity));
     let calls = TaskTracker::new();
@@ -165,14 +163,9 @@ async fn read_loop<St, S>(
                 break;
             }
         };
-        // Waiting for a slot would stop reading, and with it noticing that the client left.
-        let Ok(slot) = slots.clone().try_acquire_owned() else {
-            let Some(busy) = busy(&body, max_response_size) else { continue };
-            match reading.run_until_cancelled(sender.send(busy)).await {
-                Some(Ok(())) => continue,
-                // The connection is closing.
-                _ => break,
-            }
+        let Some(Ok(slot)) = reading.run_until_cancelled(slots.clone().acquire_owned()).await
+        else {
+            break;
         };
         let (rpc_service, sender, batch_config) =
             (rpc_service.clone(), sender.clone(), config.batch_requests_config);
@@ -241,41 +234,6 @@ async fn write_loop<Si>(
     if !timed_out {
         let _ = tokio::time::timeout(write_timeout, sink.close()).await;
     }
-}
-
-// The `-32009 Server is busy` answer to `body`, with one error per call of a batch under its id,
-// or `None` if it holds only notifications, which get no answer.
-fn busy(body: &[u8], max_response_size: usize) -> Option<String> {
-    let unreadable = || Some(MethodResponse::error(Id::None, ErrorCode::ServerIsBusy).into_json());
-    let Some((message, is_single)) = split_message(body) else { return unreadable() };
-    if is_single {
-        return busy_call(message).map(MethodResponse::into_json);
-    }
-    let Ok(entries) = serde_json::from_slice::<Vec<&RawValue>>(message) else {
-        return unreadable();
-    };
-    if entries.is_empty() {
-        return unreadable();
-    }
-    // Built like any batch answer, so it can't pass the response size limit.
-    let mut answers = BatchResponseBuilder::new(max_response_size);
-    for answer in entries.iter().filter_map(|entry| busy_call(entry.get().as_bytes())) {
-        if let Err(too_big) = answers.append(answer) {
-            return Some(too_big.into_json());
-        }
-    }
-    (!answers.is_empty()).then(|| answers.finish().into_json())
-}
-
-// The busy error for one request, or `None` for a notification. A request that fails to parse is
-// answered under a `null` id.
-fn busy_call(message: &[u8]) -> Option<MethodResponse> {
-    let id = match serde_json::from_slice::<Request<'_>>(message) {
-        // An absent id marks a notification, while `"id": null` still expects an answer.
-        Ok(request) => request.id?,
-        Err(_) => Id::None,
-    };
-    Some(MethodResponse::error(id, ErrorCode::ServerIsBusy))
 }
 
 // The JSON to send back for `body`, if any.
