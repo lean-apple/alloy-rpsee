@@ -182,9 +182,9 @@ pub enum BatchRequestConfig {
 
 /// Answers `body`, a single message if `is_single` or else a batch, through `rpc_service`.
 ///
-/// The transport picks `is_single` and limits the body size. It sends the response unless it
-/// [is a notification](MethodResponse::is_notification) or
-/// [a subscription](MethodResponse::is_subscription), which already answered on its connection. A
+/// The transport picks `is_single` and limits the body size. It sends what
+/// [`MethodResponse::into_message`] returns, which is nothing for a notification or for a
+/// subscription, which already answered on its connection. A
 /// call that panics is answered with `-32603 Internal error`.
 ///
 /// # Examples

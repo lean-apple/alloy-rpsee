@@ -261,9 +261,8 @@ async fn answer<S: RpcServiceT>(
     let Some((message, is_single)) = split_message(body) else {
         return Some(MethodResponse::error(Id::None, ErrorCode::ParseError).into_json());
     };
-    let response = handle_rpc_call(message, is_single, batch_config, rpc_service).await;
     // Notifications get no answer, and a subscription already sent its own.
-    (!response.is_notification() && !response.is_subscription()).then(|| response.into_json())
+    handle_rpc_call(message, is_single, batch_config, rpc_service).await.into_message()
 }
 
 // Writes `messages` and flushes once, leaving `messages` empty.

@@ -31,6 +31,8 @@ const INTERNAL_ERROR_JSON: &str =
 ///     response.into_json(),
 ///     r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}"#
 /// );
+///
+/// assert_eq!(MethodResponse::notification().into_message(), None);
 /// ```
 #[derive(Debug)]
 pub struct MethodResponse {
@@ -114,6 +116,15 @@ impl MethodResponse {
     /// Takes the serialized JSON.
     pub fn into_json(self) -> String {
         self.json
+    }
+
+    /// Takes the JSON a connection sends back, or `None` for the answer to a notification or an
+    /// accepted subscribe call, which send nothing.
+    pub fn into_message(self) -> Option<String> {
+        match self.kind {
+            Kind::Notification | Kind::Subscription => None,
+            Kind::Success | Kind::Error | Kind::Batch => Some(self.json),
+        }
     }
 }
 
@@ -229,5 +240,18 @@ mod tests {
             MethodResponse::error(Id::Number(1), err).into_json(),
             r#"{"jsonrpc":"2.0","id":1,"error":{"code":3,"message":"execution reverted","data":"0xdead"}}"#
         );
+    }
+
+    #[test]
+    fn only_answers_are_messages() {
+        let json = r#"{"jsonrpc":"2.0","id":1,"result":"a"}"#;
+        let success = MethodResponse::success(Id::Number(1), "a", usize::MAX);
+        assert_eq!(success.into_message().as_deref(), Some(json));
+        let error = MethodResponse::error(Id::Number(1), ErrorCode::MethodNotFound);
+        assert!(error.into_message().is_some());
+        let batch = MethodResponse::from_batch(format!("[{json}]"));
+        assert!(batch.into_message().is_some());
+        assert_eq!(MethodResponse::notification().into_message(), None);
+        assert_eq!(MethodResponse::subscription().into_message(), None);
     }
 }
