@@ -246,23 +246,38 @@ fn parse_batch(body: &[u8], batch_config: BatchRequestConfig) -> Result<Batch<'_
         BatchRequestConfig::Limit(limit) => usize::try_from(limit).unwrap_or(usize::MAX),
         BatchRequestConfig::Unlimited => usize::MAX,
     };
-    // Each entry is kept as raw JSON first, since serde can't continue an array past an element
-    // that fails to decode.
+    // A batch of valid requests, which most are, decodes in one pass.
+    if let Ok(requests) = serde_json::from_slice::<Vec<Request<'_>>>(body) {
+        check_batch_len(requests.len(), max_entries)?;
+        return Ok(requests.into_iter().map(|request| Ok(sort_request(request))).collect());
+    }
+    // Any other batch is split into raw JSON entries first, since serde can't continue an array
+    // past an element that fails to decode.
     let entries = serde_json::from_slice::<Vec<&RawValue>>(body).map_err(|_| BatchError::Parse)?;
-    if entries.len() > max_entries {
+    check_batch_len(entries.len(), max_entries)?;
+    Ok(entries.into_iter().map(|entry| parse_entry(entry.get())).collect())
+}
+
+// Rejects a batch of more than `max_entries` entries.
+fn check_batch_len(entries: usize, max_entries: usize) -> Result<(), BatchError> {
+    if entries > max_entries {
         return Err(BatchError::TooBig { limit: max_entries });
     }
-    Ok(entries.into_iter().map(|entry| parse_entry(entry.get())).collect())
+    Ok(())
 }
 
 // Sorts one message, alone or in a batch, into a call, a notification, or the error it is
 // answered with.
 fn parse_entry(message: &str) -> Result<BatchEntry<'_>, BatchEntryErr> {
     match serde_json::from_str::<Request<'_>>(message) {
-        Ok(request) if request.id.is_none() => Ok(BatchEntry::Notification(request)),
-        Ok(request) => Ok(BatchEntry::Call(request)),
+        Ok(request) => Ok(sort_request(request)),
         Err(_) => Err(invalid_entry(message)),
     }
+}
+
+// Sorts a request into a call, which has an id, or a notification, which has none.
+fn sort_request(request: Request<'_>) -> BatchEntry<'_> {
+    if request.id.is_none() { BatchEntry::Notification(request) } else { BatchEntry::Call(request) }
 }
 
 // `-32700 Parse error` for a message that isn't JSON, otherwise `-32600 Invalid request` to the id
@@ -409,11 +424,32 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn batch_of_valid_entries_is_answered_in_order() {
+        let body = concat!(
+            r#"[{"jsonrpc":"2.0","id":1,"method":"count"},"#,
+            r#"{"jsonrpc":"2.0","method":"count"},"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"x"},"#,
+            r#"{"jsonrpc":"2.0","id":3,"method":"count"}]"#,
+        );
+        assert_eq!(
+            answer(body, BatchRequestConfig::Unlimited).await,
+            concat!(
+                r#"[{"jsonrpc":"2.0","id":1,"result":0},"#,
+                r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"Method not found"}},"#,
+                r#"{"jsonrpc":"2.0","id":3,"result":1}]"#,
+            )
+        );
+    }
+
     #[test_case("[]", BatchRequestConfig::Unlimited, r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid request"}}"# ; "empty")]
     #[test_case("[1", BatchRequestConfig::Unlimited, r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}"# ; "not json")]
     #[test_case("[1]", BatchRequestConfig::Disabled, r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32005,"message":"Batched requests are not supported by this server"}}"# ; "disabled")]
     #[test_case("[1,2]", BatchRequestConfig::Limit(1), r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32010,"message":"The batch request was too large","data":"Exceeded max limit of 1"}}"# ; "too many entries")]
     #[test_case("[1]", BatchRequestConfig::Limit(1), r#"[{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid request"}}]"# ; "at the limit")]
+    #[test_case(r#"[{"jsonrpc":"2.0","id":1,"method":"count"},{"jsonrpc":"2.0","id":2,"method":"count"}]"#, BatchRequestConfig::Limit(1), r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32010,"message":"The batch request was too large","data":"Exceeded max limit of 1"}}"# ; "too many valid entries")]
+    #[test_case(r#"[{"jsonrpc":"2.0","id":1,"method":"count"}]"#, BatchRequestConfig::Limit(1), r#"[{"jsonrpc":"2.0","id":1,"result":0}]"# ; "valid entries at the limit")]
+    #[test_case(r#"[{"jsonrpc":"2.0","method":"count"}]"#, BatchRequestConfig::Unlimited, "" ; "only notifications")]
     #[tokio::test]
     async fn batch_errors(body: &str, batch_config: BatchRequestConfig, response: &str) {
         assert_eq!(answer(body, batch_config).await, response);
