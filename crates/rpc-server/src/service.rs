@@ -46,19 +46,16 @@ use std::{
 /// answers a connection's calls concurrently.
 pub trait RpcServiceT {
     /// Answers a call.
-    fn call<'a>(&self, request: Request<'a>) -> impl Future<Output = MethodResponse> + Send + 'a;
+    fn call(&self, request: Request<'_>) -> impl Future<Output = MethodResponse> + Send;
 
     /// Answers a batch.
     ///
     /// [`RpcService`] runs the entries through its own `call`, so middleware that must see each
     /// entry has to handle them here too.
-    fn batch<'a>(&self, batch: Batch<'a>) -> impl Future<Output = MethodResponse> + Send + 'a;
+    fn batch(&self, batch: Batch<'_>) -> impl Future<Output = MethodResponse> + Send;
 
     /// Handles a notification. The returned response is never sent.
-    fn notification<'a>(
-        &self,
-        request: Request<'a>,
-    ) -> impl Future<Output = MethodResponse> + Send + 'a;
+    fn notification(&self, request: Request<'_>) -> impl Future<Output = MethodResponse> + Send;
 }
 
 /// The innermost service, which calls the registered methods.
@@ -91,7 +88,7 @@ impl RpcService {
 }
 
 impl RpcServiceT for RpcService {
-    fn call<'a>(&self, request: Request<'a>) -> impl Future<Output = MethodResponse> + Send + 'a {
+    fn call(&self, request: Request<'_>) -> impl Future<Output = MethodResponse> + Send {
         let id = request.id.unwrap_or(Id::None);
         match self.methods.method(&request.method) {
             Some(method) => {
@@ -105,7 +102,7 @@ impl RpcServiceT for RpcService {
         }
     }
 
-    fn batch<'a>(&self, batch: Batch<'a>) -> impl Future<Output = MethodResponse> + Send + 'a {
+    fn batch(&self, batch: Batch<'_>) -> impl Future<Output = MethodResponse> + Send {
         let service = self.clone();
         async move {
             let mut responses = BatchResponseBuilder::new(service.max_response_size);
@@ -140,10 +137,7 @@ impl RpcServiceT for RpcService {
         }
     }
 
-    fn notification<'a>(
-        &self,
-        _request: Request<'a>,
-    ) -> impl Future<Output = MethodResponse> + Send + 'a {
+    fn notification(&self, _request: Request<'_>) -> impl Future<Output = MethodResponse> + Send {
         // Notifications aren't run, as in jsonrpsee.
         ready(MethodResponse::notification())
     }
@@ -152,24 +146,21 @@ impl RpcServiceT for RpcService {
 /// Runs one of two services, as `tower::ServiceBuilder::option_layer` builds.
 #[cfg(feature = "server")]
 impl<A: RpcServiceT, B: RpcServiceT> RpcServiceT for tower::util::Either<A, B> {
-    fn call<'a>(&self, request: Request<'a>) -> impl Future<Output = MethodResponse> + Send + 'a {
+    fn call(&self, request: Request<'_>) -> impl Future<Output = MethodResponse> + Send {
         match self {
             Self::Left(service) => Either::Left(service.call(request)),
             Self::Right(service) => Either::Right(service.call(request)),
         }
     }
 
-    fn batch<'a>(&self, batch: Batch<'a>) -> impl Future<Output = MethodResponse> + Send + 'a {
+    fn batch(&self, batch: Batch<'_>) -> impl Future<Output = MethodResponse> + Send {
         match self {
             Self::Left(service) => Either::Left(service.batch(batch)),
             Self::Right(service) => Either::Right(service.batch(batch)),
         }
     }
 
-    fn notification<'a>(
-        &self,
-        request: Request<'a>,
-    ) -> impl Future<Output = MethodResponse> + Send + 'a {
+    fn notification(&self, request: Request<'_>) -> impl Future<Output = MethodResponse> + Send {
         match self {
             Self::Left(service) => Either::Left(service.notification(request)),
             Self::Right(service) => Either::Right(service.notification(request)),

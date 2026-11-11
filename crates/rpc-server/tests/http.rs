@@ -141,25 +141,25 @@ struct Counted<S> {
 }
 
 impl<S: RpcServiceT> RpcServiceT for Counted<S> {
-    fn call<'a>(
+    fn call(
         &self,
-        request: alloy_rpc_server::Request<'a>,
-    ) -> impl Future<Output = alloy_rpc_server::MethodResponse> + Send + 'a {
+        request: alloy_rpc_server::Request<'_>,
+    ) -> impl Future<Output = alloy_rpc_server::MethodResponse> + Send {
         self.calls.fetch_add(1, Ordering::Relaxed);
         self.inner.call(request)
     }
 
-    fn batch<'a>(
+    fn batch(
         &self,
-        batch: alloy_rpc_server::Batch<'a>,
-    ) -> impl Future<Output = alloy_rpc_server::MethodResponse> + Send + 'a {
+        batch: alloy_rpc_server::Batch<'_>,
+    ) -> impl Future<Output = alloy_rpc_server::MethodResponse> + Send {
         self.inner.batch(batch)
     }
 
-    fn notification<'a>(
+    fn notification(
         &self,
-        request: alloy_rpc_server::Request<'a>,
-    ) -> impl Future<Output = alloy_rpc_server::MethodResponse> + Send + 'a {
+        request: alloy_rpc_server::Request<'_>,
+    ) -> impl Future<Output = alloy_rpc_server::MethodResponse> + Send {
         self.inner.notification(request)
     }
 }
