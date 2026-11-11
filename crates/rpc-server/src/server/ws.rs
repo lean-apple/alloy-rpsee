@@ -298,6 +298,40 @@ mod tests {
     use test_case::test_case;
     use tokio::{sync::Notify, time::Instant};
 
+    // Counts the messages written to it and its flushes.
+    #[derive(Default)]
+    struct CountingSink {
+        // The messages written.
+        messages: usize,
+        // The flushes.
+        flushes: usize,
+    }
+
+    impl Sink<Message> for CountingSink {
+        type Error = WsError;
+
+        fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(mut self: Pin<&mut Self>, _message: Message) -> Result<(), WsError> {
+            self.messages += 1;
+            Ok(())
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), WsError>> {
+            self.flushes += 1;
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
     #[test_case(false, false; "pending call is dropped")]
     #[test_case(true, false; "running call finishes")]
     #[test_case(true, true; "full response queue")]
@@ -409,39 +443,5 @@ mod tests {
         write_loop(&mut sink, outgoing, Duration::from_secs(1), &answered, &reading).await;
         assert_eq!((sink.messages, sink.flushes), (queued, flushes));
         assert!(reading.is_cancelled());
-    }
-
-    // Counts the messages written to it and its flushes.
-    #[derive(Default)]
-    struct CountingSink {
-        // The messages written.
-        messages: usize,
-        // The flushes.
-        flushes: usize,
-    }
-
-    impl Sink<Message> for CountingSink {
-        type Error = WsError;
-
-        fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), WsError>> {
-            Poll::Ready(Ok(()))
-        }
-
-        fn start_send(mut self: Pin<&mut Self>, _message: Message) -> Result<(), WsError> {
-            self.messages += 1;
-            Ok(())
-        }
-
-        fn poll_flush(
-            mut self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<Result<(), WsError>> {
-            self.flushes += 1;
-            Poll::Ready(Ok(()))
-        }
-
-        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), WsError>> {
-            Poll::Ready(Ok(()))
-        }
     }
 }
