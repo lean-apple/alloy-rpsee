@@ -28,10 +28,11 @@
 //!
 //! The connection reads requests and runs each as its own call, at most
 //! `message_buffer_capacity` at once, while a writer sends answers and subscription
-//! notifications from the connection's bounded queue. A write that takes longer than the write
-//! timeout closes the connection, so a client that stops reading can't hold its messages. A
-//! message over the request size limit is answered with `-32007 Request is too big` and skipped,
-//! unless it only passes the limit in a later frame, which closes the connection. On
+//! notifications from the connection's bounded queue. Messages queued together are written with
+//! one flush. A write that takes longer than the write timeout closes the connection, so a client
+//! that stops reading can't hold its messages. A message over the request size limit is answered
+//! with `-32007 Request is too big` and skipped, unless it only passes the limit in a later frame,
+//! which closes the connection. On
 //! shutdown, running calls have 30 seconds to finish before their futures are dropped. Already
 //! running blocking callbacks continue on their pool.
 
@@ -64,6 +65,9 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 // Bounds the grace period for calls after the connection stops accepting requests.
 const CALL_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+
+// The most queued messages written before a flush, so one write timeout covers a bounded write.
+const MAX_MESSAGES_PER_FLUSH: usize = 64;
 
 // A WebSocket connection, before and after hyper hands over its socket.
 pub(crate) struct WsConnection<S> {
@@ -202,7 +206,8 @@ async fn read_loop<St, S>(
 }
 
 // Sends queued messages until every call is answered, a write fails, or a write takes longer than
-// `write_timeout`, then closes the queue and cancels `reading`.
+// `write_timeout`, then closes the queue and cancels `reading`. Messages queued together share a
+// flush.
 async fn write_loop<Si>(
     mut sink: Si,
     mut outgoing: mpsc::Receiver<String>,
@@ -213,20 +218,19 @@ async fn write_loop<Si>(
     Si: Sink<Message, Error = WsError> + Unpin,
 {
     let mut timed_out = false;
+    let mut queued = Vec::with_capacity(MAX_MESSAGES_PER_FLUSH);
     loop {
-        let json = match answered.run_until_cancelled(outgoing.recv()).await {
-            Some(Some(json)) => json,
-            Some(None) => break,
+        let next = outgoing.recv_many(&mut queued, MAX_MESSAGES_PER_FLUSH);
+        if answered.run_until_cancelled(next).await.is_none() {
             // Every call is answered, so only the queued messages are left to send.
-            None => {
-                outgoing.close();
-                match outgoing.recv().await {
-                    Some(json) => json,
-                    None => break,
-                }
-            }
-        };
-        match tokio::time::timeout(write_timeout, sink.send(Message::text(json))).await {
+            outgoing.close();
+            outgoing.recv_many(&mut queued, MAX_MESSAGES_PER_FLUSH).await;
+        }
+        // The queue is closed and empty.
+        if queued.is_empty() {
+            break;
+        }
+        match tokio::time::timeout(write_timeout, send_all(&mut sink, &mut queued)).await {
             Ok(Ok(())) => {}
             Ok(Err(err)) => {
                 tracing::debug!(%err, "WebSocket write failed");
@@ -262,6 +266,17 @@ async fn answer<S: RpcServiceT>(
     (!response.is_notification() && !response.is_subscription()).then(|| response.into_json())
 }
 
+// Writes `messages` and flushes once, leaving `messages` empty.
+async fn send_all<Si>(sink: &mut Si, messages: &mut Vec<String>) -> Result<(), WsError>
+where
+    Si: Sink<Message, Error = WsError> + Unpin,
+{
+    for json in messages.drain(..) {
+        sink.feed(Message::text(json)).await?;
+    }
+    sink.flush().await
+}
+
 /// Returns `true` if `headers` ask to switch to WebSocket.
 ///
 /// Only the `Upgrade` header is checked. The handshake validates the rest.
@@ -276,9 +291,46 @@ mod tests {
     use super::*;
     use crate::{ErrorPayload, RpcModule, RpcService};
     use futures_util::FutureExt;
-    use std::pin::pin;
+    use std::{
+        pin::{Pin, pin},
+        task::{Context, Poll},
+    };
     use test_case::test_case;
     use tokio::{sync::Notify, time::Instant};
+
+    // Counts the messages written to it and its flushes.
+    #[derive(Default)]
+    struct CountingSink {
+        // The messages written.
+        messages: usize,
+        // The flushes.
+        flushes: usize,
+    }
+
+    impl Sink<Message> for CountingSink {
+        type Error = WsError;
+
+        fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(mut self: Pin<&mut Self>, _message: Message) -> Result<(), WsError> {
+            self.messages += 1;
+            Ok(())
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), WsError>> {
+            self.flushes += 1;
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+            Poll::Ready(Ok(()))
+        }
+    }
 
     #[test_case(false, false; "pending call is dropped")]
     #[test_case(true, false; "running call finishes")]
@@ -375,5 +427,21 @@ mod tests {
             None
         );
         assert_eq!(Arc::strong_count(&service), 1);
+    }
+
+    #[test_case(3, 1; "queued together")]
+    #[test_case(MAX_MESSAGES_PER_FLUSH + 1, 2; "past the cap")]
+    #[tokio::test]
+    async fn queued_messages_share_a_flush(queued: usize, flushes: usize) {
+        let (sender, outgoing) = mpsc::channel(queued);
+        for _ in 0..queued {
+            sender.try_send(String::new()).unwrap();
+        }
+        drop(sender);
+        let mut sink = CountingSink::default();
+        let (answered, reading) = (CancellationToken::new(), CancellationToken::new());
+        write_loop(&mut sink, outgoing, Duration::from_secs(1), &answered, &reading).await;
+        assert_eq!((sink.messages, sink.flushes), (queued, flushes));
+        assert!(reading.is_cancelled());
     }
 }

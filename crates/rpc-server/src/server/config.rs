@@ -162,8 +162,9 @@ impl ServerConfigBuilder {
         self
     }
 
-    /// Sets how long one WebSocket write may take before the connection is closed, so a client
-    /// that stops reading can't hold its messages. Defaults to 10 seconds.
+    /// Sets how long one WebSocket write, of the messages queued together, may take before the
+    /// connection is closed, so a client that stops reading can't hold its messages. Defaults to
+    /// 10 seconds.
     pub const fn set_ws_write_timeout(mut self, timeout: Duration) -> Self {
         self.0.ws_write_timeout = timeout;
         self
