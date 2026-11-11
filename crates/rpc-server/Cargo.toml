@@ -5,7 +5,8 @@ description = "JSON-RPC 2.0 server built on Alloy"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+# Parts of this crate are derived from jsonrpsee, which is MIT only. See `LICENSE-JSONRPSEE`.
+license = "MIT"
 repository.workspace = true
 
 [lints]
