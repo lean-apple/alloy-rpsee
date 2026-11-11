@@ -39,6 +39,9 @@ pub use subscription::{
     SubscriptionResult, SubscriptionSink,
 };
 
+#[cfg(feature = "server")]
+mod utils;
+
 mod writer;
 
 /// The result of an RPC method.
