@@ -12,10 +12,20 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{net::TcpStream, sync::mpsc};
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async,
-    tungstenite::{Error as WsError, Message, http::StatusCode as WsStatus},
+    tungstenite::{
+        Error as WsError, Message,
+        http::StatusCode as WsStatus,
+        protocol::frame::{
+            Frame,
+            coding::{Data, OpCode},
+        },
+    },
 };
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+// The answer to a message over a 64 byte request size limit.
+const OVERSIZED_REQUEST_JSON: &str = r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32007,"message":"Request is too big","data":"Exceeded max limit of 64"}}"#;
 
 // Reports on its channel when dropped, unless the test already ended.
 struct OnDrop(Arc<mpsc::Sender<()>>);
@@ -184,14 +194,28 @@ async fn ws_only_refuses_plain_http() {
 }
 
 #[tokio::test]
-async fn oversized_message_is_answered_then_closed() {
+async fn oversized_message_is_answered_and_skipped() {
     let (addr, _handle, _) = start(ServerConfig::builder().max_request_body_size(64).build()).await;
     let mut ws = connect(addr).await;
-    ws.send(Message::text("x".repeat(65))).await.unwrap();
+    assert_eq!(call(&mut ws, &"x".repeat(65)).await, OVERSIZED_REQUEST_JSON);
+    // The connection carries on.
     assert_eq!(
-        recv(&mut ws).await,
-        r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32007,"message":"Request is too big","data":"Exceeded max limit of 64"}}"#
+        call(&mut ws, r#"{"jsonrpc":"2.0","id":1,"method":"eth_chainId"}"#).await,
+        r#"{"jsonrpc":"2.0","id":1,"result":"0x1"}"#
     );
+}
+
+#[tokio::test]
+async fn message_growing_past_the_limit_is_answered_then_closed() {
+    let (addr, _handle, _) = start(ServerConfig::builder().max_request_body_size(64).build()).await;
+    let mut ws = connect(addr).await;
+    let first = Frame::message("x".repeat(40), OpCode::Data(Data::Text), false);
+    let last = Frame::message("x".repeat(40), OpCode::Data(Data::Continue), true);
+    ws.send(Message::Frame(first)).await.unwrap();
+    ws.send(Message::Frame(last)).await.unwrap();
+    assert_eq!(recv(&mut ws).await, OVERSIZED_REQUEST_JSON);
+    let closed = tokio::time::timeout(Duration::from_secs(5), ws.next()).await.unwrap();
+    assert!(matches!(closed, Some(Ok(Message::Close(_)))), "expected a close, got {closed:?}");
 }
 
 #[tokio::test]

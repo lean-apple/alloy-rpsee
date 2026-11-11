@@ -67,6 +67,7 @@ server = [
     "dep:tokio-tungstenite",
     "dep:tower",
     "futures-util/sink",
+    "tokio/io-util",
     "tokio/net",
     "tokio-util/rt",
 ]

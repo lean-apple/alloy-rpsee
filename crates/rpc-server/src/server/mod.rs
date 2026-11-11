@@ -18,6 +18,8 @@ pub use handle::ServerHandle;
 pub mod http;
 pub use http::{BoxError, HttpBody, HttpRequest, HttpResponse};
 
+mod request_size_limit;
+
 mod ws;
 pub use ws::is_upgrade_request;
 
