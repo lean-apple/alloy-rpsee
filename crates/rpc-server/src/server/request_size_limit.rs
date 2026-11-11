@@ -6,10 +6,15 @@
 //! carries on. A skipped frame is still held to the checks the decoder makes on the frames it
 //! reads.
 
-use crate::{MethodResponse, error::ErrorCode};
+use crate::{
+    MethodResponse,
+    error::ErrorCode,
+    utils::{saturating_u64, saturating_usize},
+};
 use alloy_json_rpc::Id;
 use std::{
     io::{self, Cursor},
+    ops::ControlFlow,
     pin::Pin,
     task::{Context, Poll, ready},
 };
@@ -27,6 +32,9 @@ use tokio_tungstenite::tungstenite::{
 
 // The most bytes a frame header takes.
 const MAX_HEADER_SIZE: usize = 14;
+
+// How many bytes are read from the socket at once, held per connection.
+const READ_BUFFER_SIZE: usize = 8 * 1024;
 
 // The bits of a header's second byte holding the payload length, or one of the two markers below.
 const LENGTH_BITS: u8 = 0x7f;
@@ -56,7 +64,8 @@ pub(crate) struct RequestSizeLimit<Io> {
     sender: mpsc::Sender<String>,
     // What the next bytes of the socket are.
     state: State,
-    // The current frame's header, of which `filled` bytes are read and `forwarded` handed on.
+    // The header of a frame whose header arrived in pieces, of which `filled` bytes are read and
+    // `forwarded` handed on. A header read whole is used where it lies in `io`.
     header: [u8; MAX_HEADER_SIZE],
     // How many bytes of `header` are read.
     filled: usize,
@@ -65,6 +74,15 @@ pub(crate) struct RequestSizeLimit<Io> {
     // The message whose later frames are still arriving, if any.
     unfinished: Unfinished,
 }
+
+// How one step of a read ends: whether the read carries on, or hands the decoder what it has.
+type Step = Poll<io::Result<ControlFlow<()>>>;
+
+// The read carries on with the next step.
+const CARRY_ON: Step = Poll::Ready(Ok(ControlFlow::Continue(())));
+
+// The read ends, and the decoder sees what was read so far.
+const HAND_OVER: Step = Poll::Ready(Ok(ControlFlow::Break(())));
 
 // What became of a message whose later frames are still arriving.
 enum Unfinished {
@@ -80,9 +98,9 @@ enum Unfinished {
 enum State {
     // A frame header.
     Header,
-    // This many payload bytes for the decoder, after the bytes of `header` not yet handed on.
+    // This many bytes of a frame for the decoder, after the bytes of `header` not yet handed on.
     Forward(u64),
-    // This many payload bytes of a skipped message.
+    // This many bytes of a skipped frame.
     Discard(u64),
 }
 
@@ -91,7 +109,7 @@ impl<Io: AsyncRead> RequestSizeLimit<Io> {
     pub(crate) fn new(io: Io, max_size: u32, sender: mpsc::Sender<String>) -> Self {
         let too_big = ErrorCode::OversizedRequest.exceeded(max_size);
         Self {
-            io: BufReader::new(io),
+            io: BufReader::with_capacity(READ_BUFFER_SIZE, io),
             max_size: max_size.into(),
             too_big: MethodResponse::error(Id::None, too_big).into_json(),
             sender,
@@ -103,17 +121,12 @@ impl<Io: AsyncRead> RequestSizeLimit<Io> {
         }
     }
 
-    // Decides what to do with the frame whose header was just read.
+    // Returns `true` if the frame with `header` and a payload of `len` bytes is skipped.
     //
     // # Errors
     //
     // Returns the error the decoder would raise on a skipped frame, which it never reads.
-    fn route(&mut self) -> Result<State, ProtocolError> {
-        let read = self.header.get(..self.filled).unwrap_or_default();
-        let Ok(Some((header, len))) = FrameHeader::parse(&mut Cursor::new(read)) else {
-            // The decoder rejects this header too, which ends the connection.
-            return Ok(State::Forward(u64::MAX));
-        };
+    fn skips(&mut self, header: &FrameHeader, len: u64) -> Result<bool, ProtocolError> {
         let skip = match (header.opcode, &self.unfinished) {
             (OpCode::Data(Data::Text | Data::Binary), Unfinished::Nothing) => len > self.max_size,
             // The decoder rejects a message that starts inside the one it holds.
@@ -123,9 +136,7 @@ impl<Io: AsyncRead> RequestSizeLimit<Io> {
             }
             (OpCode::Data(Data::Continue), unfinished) => matches!(unfinished, Unfinished::Skipped),
             // Control frames belong to no message and may arrive in the middle of one.
-            (OpCode::Control(_) | OpCode::Data(Data::Reserved(_)), _) => {
-                return Ok(State::Forward(len));
-            }
+            (OpCode::Control(_) | OpCode::Data(Data::Reserved(_)), _) => return Ok(false),
         };
         if skip {
             if header.mask.is_none() {
@@ -147,7 +158,25 @@ impl<Io: AsyncRead> RequestSizeLimit<Io> {
             (false, true) => Unfinished::Skipped,
             (false, false) => Unfinished::Forwarded,
         };
-        Ok(if skip { State::Discard(len) } else { State::Forward(len) })
+        Ok(skip)
+    }
+
+    // Decides what to do with the `len` bytes that follow the header in `read`, which holds
+    // `header_size` bytes not handed on yet when it is parsed where it lies in `io`.
+    //
+    // # Errors
+    //
+    // Returns the error of [`Self::skips`].
+    fn route(&mut self, parsed: Option<(FrameHeader, u64)>, header_size: u64) -> io::Result<State> {
+        let Some((header, len)) = parsed else {
+            // The decoder rejects this header too, which ends the connection.
+            return Ok(State::Forward(u64::MAX));
+        };
+        let skip = self
+            .skips(&header, len)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        let left = header_size.saturating_add(len);
+        Ok(if skip { State::Discard(left) } else { State::Forward(left) })
     }
 
     // Starts over on the next frame.
@@ -165,66 +194,122 @@ impl<Io: AsyncRead + Unpin> AsyncRead for RequestSizeLimit<Io> {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = &mut *self;
-        if buf.remaining() == 0 {
-            return Poll::Ready(Ok(()));
-        }
-        loop {
-            match this.state {
-                State::Header => {
-                    let wanted = header_len(this.header.get(..this.filled).unwrap_or_default());
-                    let missing = this.header.get_mut(this.filled..wanted).unwrap_or_default();
-                    if missing.is_empty() {
-                        this.state = this
-                            .route()
-                            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-                        continue;
-                    }
-                    let mut missing = ReadBuf::new(missing);
-                    ready!(Pin::new(&mut this.io).poll_read(cx, &mut missing))?;
-                    let read = missing.filled().len();
-                    if read == 0 {
-                        // The socket closed.
-                        return Poll::Ready(Ok(()));
-                    }
-                    this.filled = this.filled.saturating_add(read);
-                }
-                State::Forward(left) => {
-                    let header = this.header.get(this.forwarded..this.filled).unwrap_or_default();
-                    if !header.is_empty() {
-                        let fitting = header.len().min(buf.remaining());
-                        buf.put_slice(header.get(..fitting).unwrap_or_default());
-                        this.forwarded = this.forwarded.saturating_add(fitting);
-                        return Poll::Ready(Ok(()));
-                    }
-                    if left == 0 {
-                        this.next_frame();
-                        continue;
-                    }
-                    let fitting = usize::try_from(left).unwrap_or(usize::MAX).min(buf.remaining());
-                    let mut payload = ReadBuf::new(buf.initialize_unfilled_to(fitting));
-                    ready!(Pin::new(&mut this.io).poll_read(cx, &mut payload))?;
-                    let read = payload.filled().len();
-                    buf.advance(read);
-                    this.state = State::Forward(left.saturating_sub(as_u64(read)));
-                    // Nothing read means the socket closed, which the decoder sees as well.
-                    return Poll::Ready(Ok(()));
-                }
-                State::Discard(left) => {
-                    if left == 0 {
-                        this.next_frame();
-                        continue;
-                    }
-                    let buffered = ready!(Pin::new(&mut this.io).poll_fill_buf(cx))?.len();
-                    if buffered == 0 {
-                        // The socket closed.
-                        return Poll::Ready(Ok(()));
-                    }
-                    let read = usize::try_from(left).unwrap_or(usize::MAX).min(buffered);
-                    Pin::new(&mut this.io).consume(read);
-                    this.state = State::Discard(left.saturating_sub(as_u64(read)));
-                }
+        let already_filled = buf.filled().len();
+        while buf.remaining() > 0 {
+            // Once the decoder has bytes, only the frames already read from the socket are added,
+            // so it never waits on the socket for more.
+            if this.io.buffer().is_empty() && buf.filled().len() > already_filled {
+                break;
+            }
+            let step = match this.state {
+                State::Header => this.poll_header(cx),
+                State::Forward(left) => this.poll_forward(cx, buf, left),
+                State::Discard(left) => this.poll_discard(cx, left),
+            };
+            if ready!(step)?.is_break() {
+                break;
             }
         }
+        Poll::Ready(Ok(()))
+    }
+}
+
+// The steps of a read, one per `State`. Each breaks when the decoder has to see what was read so
+// far, which is nothing once the socket closed.
+impl<Io: AsyncRead + Unpin> RequestSizeLimit<Io> {
+    // Routes the next frame by its header.
+    fn poll_header(&mut self, cx: &mut Context<'_>) -> Step {
+        if self.filled > 0 {
+            return self.poll_split_header(cx);
+        }
+        if self.io.buffer().is_empty()
+            && ready!(Pin::new(&mut self.io).poll_fill_buf(cx))?.is_empty()
+        {
+            // The socket closed.
+            return HAND_OVER;
+        }
+        // A header read whole is parsed where it lies and handed on, or skipped, with its payload.
+        let mut buffered = Cursor::new(self.io.buffer());
+        match FrameHeader::parse(&mut buffered) {
+            Ok(Some(parsed)) => {
+                let header_size = buffered.position();
+                self.state = self.route(Some(parsed), header_size)?;
+            }
+            Err(_) => self.state = self.route(None, 0)?,
+            // The rest of the header is still on the socket.
+            Ok(None) => return self.poll_split_header(cx),
+        }
+        CARRY_ON
+    }
+
+    // Copies a header that arrives in pieces into `header`, then routes its frame.
+    fn poll_split_header(&mut self, cx: &mut Context<'_>) -> Step {
+        let wanted = header_len(self.header.get(..self.filled).unwrap_or_default());
+        let missing = self.header.get_mut(self.filled..wanted).unwrap_or_default();
+        if missing.is_empty() {
+            let read = self.header.get(..self.filled).unwrap_or_default();
+            let parsed = FrameHeader::parse(&mut Cursor::new(read)).ok().flatten();
+            self.state = self.route(parsed, 0)?;
+            return CARRY_ON;
+        }
+        let mut missing = ReadBuf::new(missing);
+        ready!(Pin::new(&mut self.io).poll_read(cx, &mut missing))?;
+        let read = missing.filled().len();
+        if read == 0 {
+            // The socket closed.
+            return HAND_OVER;
+        }
+        self.filled = self.filled.saturating_add(read);
+        CARRY_ON
+    }
+
+    // Hands the decoder up to `left` bytes of the current frame, after its split header.
+    fn poll_forward(&mut self, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>, left: u64) -> Step {
+        let header = self.header.get(self.forwarded..self.filled).unwrap_or_default();
+        if !header.is_empty() {
+            let fitting = header.len().min(buf.remaining());
+            buf.put_slice(header.get(..fitting).unwrap_or_default());
+            self.forwarded = self.forwarded.saturating_add(fitting);
+            return CARRY_ON;
+        }
+        if left == 0 {
+            self.next_frame();
+            return CARRY_ON;
+        }
+        let fitting = saturating_usize(left).min(buf.remaining());
+        let buffered = self.io.buffer();
+        if buffered.is_empty() {
+            // A payload still on the socket is read straight into the decoder's buffer.
+            let mut payload = ReadBuf::new(buf.initialize_unfilled_to(fitting));
+            ready!(Pin::new(&mut self.io).poll_read(cx, &mut payload))?;
+            let read = payload.filled().len();
+            buf.advance(read);
+            self.state = State::Forward(left.saturating_sub(saturating_u64(read)));
+            // Nothing read means the socket closed, which the decoder sees as well.
+            return HAND_OVER;
+        }
+        let fitting = fitting.min(buffered.len());
+        buf.put_slice(buffered.get(..fitting).unwrap_or_default());
+        Pin::new(&mut self.io).consume(fitting);
+        self.state = State::Forward(left.saturating_sub(saturating_u64(fitting)));
+        CARRY_ON
+    }
+
+    // Drops up to `left` bytes of a skipped frame.
+    fn poll_discard(&mut self, cx: &mut Context<'_>, left: u64) -> Step {
+        if left == 0 {
+            self.next_frame();
+            return CARRY_ON;
+        }
+        let buffered = ready!(Pin::new(&mut self.io).poll_fill_buf(cx))?.len();
+        if buffered == 0 {
+            // The socket closed.
+            return HAND_OVER;
+        }
+        let read = saturating_usize(left).min(buffered);
+        Pin::new(&mut self.io).consume(read);
+        self.state = State::Discard(left.saturating_sub(saturating_u64(read)));
+        CARRY_ON
     }
 }
 
@@ -270,11 +355,6 @@ fn header_len(read: &[u8]) -> usize {
     let mask = if second & MASK_BIT == 0 { 0 } else { 4 };
     // At most `MAX_HEADER_SIZE`, so this can't overflow.
     2 + length + mask
-}
-
-// A byte count as `u64`, which holds any `usize` on supported targets.
-fn as_u64(count: usize) -> u64 {
-    u64::try_from(count).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
@@ -440,6 +520,16 @@ mod tests {
         // Reading each header and payload on its own would take thousands.
         let reads = socket.io.get_ref().reads;
         assert!(reads < 20, "{reads} reads");
+    }
+
+    #[tokio::test]
+    async fn frames_read_together_reach_the_decoder_together() {
+        let sent = [text(8, true), text(65, true), ping(), text(9, true)].concat();
+        let (sender, _answers) = mpsc::channel(1);
+        let mut socket = RequestSizeLimit::new(sent.as_slice(), MAX_SIZE, sender);
+        let mut read = [0; 128];
+        let len = socket.read(&mut read).await.unwrap();
+        assert_eq!(read.get(..len).unwrap(), [text(8, true), ping(), text(9, true)].concat());
     }
 
     #[test_case(&[text(65, false), text(9, true)], ProtocolError::ExpectedFragment(Data::Text) ; "new message inside a skipped one")]
