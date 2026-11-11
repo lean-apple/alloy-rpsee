@@ -50,7 +50,7 @@ use bytes::Bytes;
 use futures_util::{Sink, SinkExt, Stream, StreamExt, future};
 use hyper::{HeaderMap, StatusCode, header, upgrade::Upgraded};
 use hyper_util::rt::TokioIo;
-use std::{sync::Arc, time::Duration};
+use std::{pin::pin, sync::Arc, time::Duration};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_tungstenite::{
     WebSocketStream,
@@ -147,7 +147,8 @@ async fn read_loop<St, S>(
     // Bounds the calls running at once, so a client sending faster than it reads waits.
     let slots = Arc::new(Semaphore::new(capacity));
     let calls = TaskTracker::new();
-    let disconnected = CancellationToken::new();
+    // Shared by reference count, which costs a call less than a clone of the token.
+    let disconnected = Arc::new(CancellationToken::new());
     let _cancel_on_drop = disconnected.drop_guard_ref();
     while let Some(Some(message)) = reading.run_until_cancelled(stream.next()).await {
         let body = match message {
@@ -175,13 +176,18 @@ async fn read_loop<St, S>(
         };
         let (rpc_service, sender, batch_config) =
             (rpc_service.clone(), sender.clone(), config.batch_requests_config);
-        calls.spawn(disconnected.clone().run_until_cancelled_owned(async move {
-            if let Some(json) = answer(&body, batch_config, &*rpc_service).await {
-                // A failed send means the connection is closing, with no one left to answer.
-                let _ = sender.send(json).await;
-            }
+        let disconnected = disconnected.clone();
+        calls.spawn(async move {
+            let call = pin!(async {
+                if let Some(json) = answer(&body, batch_config, &*rpc_service).await {
+                    // A failed send means the connection is closing, with no one left to answer.
+                    let _ = sender.send(json).await;
+                }
+            });
+            // The call is polled first, so one that answers at once never waits on the disconnect.
+            future::select(call, pin!(disconnected.cancelled())).await;
             drop(slot);
-        }));
+        });
     }
     if !stop.is_cancelled() {
         disconnected.cancel();
